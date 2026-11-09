@@ -244,9 +244,9 @@ the only authority.
 - [x] Tests green (86/86)
 - [x] Dogfood: clicheck 15/15, doccover 9/9 clean
 - [x] Bench-audit map extended (A1–A7 clean)
-- [ ] README + CHANGELOG + LICENSE (MIT) in place
-- [ ] CI workflow (.github/workflows/tests.yml)
-- [ ] Prepublish-check clean
+- [x] README + CHANGELOG + LICENSE (MIT) in place
+- [x] CI workflow (.github/workflows/tests.yml)
+- [x] Prepublish-check clean
 
 ## License
 
