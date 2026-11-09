@@ -1,0 +1,4063 @@
+#!/usr/bin/env python3
+"""keepalivedwho - which include file:line declared this
+`vrrp_instance` / `virtual_server` / VIP, and is it gated by a
+config-id conditional?
+
+A static model of keepalived's documented configuration rules
+(DESIGN-keepalivedwho.md, BUILD APPROVED 2026-11-09). Semantics
+pinned to keepalived.conf(5) as published at keepalived.org
+(current), keepalived.conf(5) Debian bullseye (older, plain
+`include` only), keepalived(8) Arch 2025-03-29, and glob(3P)
+POSIX. Claims are tagged [documented], [docs-inferred], or
+[hypothesized]; no keepalived binary exists on this box, so no
+claim here is [observed] and there is no live-agreement test to
+skip-guard against: `keepalived -t` validates syntax but dumps
+no per-declaration provenance, so hermetic fixture trees are the
+only oracle, exactly as the manual text is the only authority.
+
+Pinned semantics (KV01-KV24 in the design doc):
+- KV01 verdict scope is declaration provenance, never election:
+  mastership is never adjudicated ([mastership-not-adjudicated]
+  on every instance answer).
+- KV02 include chain: in-place expansion at the directive point,
+  relative includes resolved against the including file's
+  directory, glob matches in byte-wise sorted order, csh-style
+  brace expansion implemented here (Python's glob does not
+  expand braces), include cycles fatal (exit 2), --conf
+  repeatable with concatenation bannered.
+- KV03 include variants and the include_check level stack:
+  plain `include` silently tolerates a missing file (warning);
+  `includea`/active `include_check` makes the same miss a
+  config error (fatal, exit 2). The level is positional and
+  stack-scoped: saved on file entry, restored on exit.
+- KV04 include detection runs before @-conditional and $
+  substitution processing: an `@`-prefixed include line or an
+  include pattern containing `$` is not followed (finding, and
+  UNKNOWN if the unfollowed subtree could hold the answer).
+- KV05 @config-id conditionals are three-valued: without
+  --config-id a @-gated line is [gated-unknown], never silently
+  included or dropped. The tool deliberately does NOT default
+  to the local hostname (the daemon's default); --config-id is
+  the reproducible form, and every run without it carries the
+  [config-id-not-given] banner.
+- KV06 $PARAM substitution is modeled positionally and
+  recursively; ${_PWD}/${_INSTANCE}/${_HASH}/${_BANG} are
+  pre-defined; ${_RANDOM} is [random-unknown]; an undefined
+  $PARAM is left as-is.
+- KV07 ~SEQ/~LST lines are unmodeled, never expanded:
+  [seq-unknown], inventoried, UNKNOWN-poisoning.
+- KV09 vrrp_instance context fields (state, interface, VRID,
+  priority, advert_int, nopreempt, ...).
+- KV10 VIP matching ignores the mask; virtual_ipaddress_excluded
+  entries still count as VIPs ([excluded-from-adverts]).
+- KV11 virtual_server: IP[:port] / fwmark / group forms; a
+  port-less (persistent) VS matches a port-qualified query with
+  a finding [docs-inferred].
+- KV12 virtual_server_group ranges are tested by membership
+  arithmetic, never enumeration.
+- KV13 duplicates are flagged, never first-wins: duplicate
+  instance names, same VIP on two instances, duplicate VS
+  IP:port, duplicate group names are AMBIGUOUS.
+- KV14 sync groups and tracking are context, never verdicts.
+- KV15 scripts are inventoried, never executed.
+- KV16 static_ipaddress entries are NOT VIPs: a query matching
+  only one is NOT-A-VIP.
+- KV17 three-valued gating propagation (Kleene core for
+  declarations).
+- KV18 exact verdict vocabulary: FOUND / GATED-UNKNOWN /
+  NOT-FOUND / NOT-A-VIP / AMBIGUOUS / UNKNOWN.
+- KV19 inventory modes --list-instances / --list-vips /
+  --list-servers.
+- KV20 coverage on every run.
+- KV21 unparseable lines poison the selected answer only;
+  unparseable lines outside the queried declaration are
+  warnings. One broken instance must not blind the tool to the
+  other forty.
+- KV22 priority/state/preempt are context; the "why didn't it
+  take it" shape ends with [mastership-not-adjudicated].
+- KV23 empty instances are FOUND with zero VIPs.
+- KV24 include variants are 2.2-era and later; auth_hmac keys
+  are inventoried as present, never with values.
+
+The tool never runs keepalived, never executes a script, never
+opens a socket, never writes, and never reads the process
+environment, and opens config and include files read-only.
+
+Exit codes: 0 verdict FOUND rendered, or an inventory mode with
+>=1 item; 1 GATED-UNKNOWN, NOT-FOUND, NOT-A-VIP, AMBIGUOUS,
+UNKNOWN, or an inventory mode with nothing listed; 2 usage
+error, missing config, include cycle (KV02), include_check
+failure (KV03), or a malformed query.
+"""
+
+import argparse
+import glob
+import ipaddress
+import json
+import os
+import re
+import sys
+
+VERSION = "1.0.0"
+
+DEFAULT_CONF = "/etc/keepalived/keepalived.conf"
+MAX_INCLUDE_DEPTH = 64
+MAX_SUBST_PASSES = 16
+
+# ---------------------------------------------------------------- findings
+
+class Finding:
+    """One structural finding. `fid` is a design-doc id (KV01..KV24)
+    or "GEN" for a generic loader problem; `severity` is one of
+    "finding", "warning", "info". `where` is "path:line" or None."""
+    def __init__(self, fid, severity, message, where=None):
+        self.fid = fid
+        self.severity = severity
+        self.message = message
+        self.where = where
+
+    def text(self):
+        loc = " (%s)" % self.where if self.where else ""
+        return "[%s] %s: %s%s" % (self.fid, self.severity, self.message, loc)
+
+    def as_json(self):
+        return {"id": self.fid, "severity": self.severity,
+                "message": self.message, "where": self.where}
+
+
+class FatalConfig(Exception):
+    """A loader defect that ends the run (exit 2): unreadable or
+    missing config, missing include under an active check level,
+    include cycle, include depth exceeded."""
+    def __init__(self, message, where=None):
+        super().__init__(message)
+        self.message = message
+        self.where = where
+
+
+class UsageError(Exception):
+    """A CLI usage defect (exit 2)."""
+    def __init__(self, message):
+        super().__init__(message)
+        self.message = message
+
+
+class _ReadError(Exception):
+    """Internal: a file could not be read. The caller decides
+    whether that is fatal (top-level config, readable check) or
+    a warning (plain include tolerates it, KV03)."""
+    def __init__(self, message, where=None):
+        super().__init__(message)
+        self.message = message
+        self.where = where
+
+
+# ------------------------------------------------------------------- gates
+
+# Gate states (KV05/KV17). Dropped lines never reach the model.
+UNGATED = "ungated"
+GATED_INCLUDED = "gated-included"
+GATED_UNKNOWN = "gated-unknown"
+
+
+def combine_gate(a, b):
+    """Combine an enclosing gate with a line's own gate. A
+    gated-unknown anywhere in the chain makes the declaration
+    gated-unknown (KV17)."""
+    if a == GATED_UNKNOWN or b == GATED_UNKNOWN:
+        return GATED_UNKNOWN
+    if a == GATED_INCLUDED or b == GATED_INCLUDED:
+        return GATED_INCLUDED
+    return UNGATED
+
+
+# --------------------------------------------------------------- tokenizing
+
+class Token:
+    """One config token. `quoted` records whether any part of the
+    token was written in quotes."""
+    __slots__ = ("text", "quoted")
+
+    def __init__(self, text, quoted=False):
+        self.text = text
+        self.quoted = quoted
+
+    def __repr__(self):
+        return "Token(%r, quoted=%r)" % (self.text, self.quoted)
+
+
+_ESCAPES = {
+    "a": "\x07", "b": "\x08", "E": "\x1b", "f": "\x0c",
+    "n": "\n", "r": "\r", "t": "\t", "v": "\x0b",
+}
+
+
+def decode_escapes(text):
+    """Decode keepalived.conf(5) quoted-string escapes: \\a \\b \\E
+    \\f \\n \\r \\t \\v, \\nnn (octal), \\xXX (hex), \\cC (control).
+    An unrecognized escape yields the escaped char literally
+    [documented]."""
+    out = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch != "\\" or i + 1 >= len(text):
+            out.append(ch)
+            i += 1
+            continue
+        nxt = text[i + 1]
+        if nxt in _ESCAPES:
+            out.append(_ESCAPES[nxt])
+            i += 2
+            continue
+        if nxt == "x":
+            hexpart = text[i + 2:i + 4]
+            if len(hexpart) == 2 and all(
+                    c in "0123456789ABCDEFabcdef" for c in hexpart):
+                out.append(chr(int(hexpart, 16)))
+                i += 4
+                continue
+            # Not a valid \xXX escape: keep the backslash and
+            # reprocess the 'x' as an ordinary character.
+            out.append("\\")
+            i += 1
+            continue
+        if nxt == "c" and i + 2 < len(text):
+            out.append(chr(ord(text[i + 2]) & 0x1f))
+            i += 3
+            continue
+        if nxt in "01234567":
+            j = i + 1
+            digits = []
+            while j < len(text) and len(digits) < 3 and \
+                    text[j] in "01234567":
+                digits.append(text[j])
+                j += 1
+            out.append(chr(int("".join(digits), 8)))
+            i = j
+            continue
+        out.append(nxt)
+        i += 2
+    return "".join(out)
+
+
+def strip_comment(line):
+    """Cut a `#` or `!` comment: either character starts a comment
+    to the end of the line anywhere outside quotes [documented].
+    A backslash-escaped quote does not end a quoted section."""
+    out = []
+    quote = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote is not None:
+            out.append(ch)
+            if ch == "\\" and i + 1 < len(line):
+                out.append(line[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("#", "!"):
+            break
+        if ch in ("'", '"'):
+            quote = ch
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def tokenize(line):
+    """Split a (comment-stripped) config line into tokens. `{` and
+    `}` are tokens of their own even when adjacent to other
+    characters (KV08); double or single quotes group one token and
+    their escapes are decoded (KV08); a `#`/`!` inside quotes is
+    literal. A backslash outside quotes is kept literally; inside
+    quotes it starts an escape (so `\"` does not close the quote).
+    A token may mix quoted and unquoted spans; only the quoted
+    spans are escape-decoded."""
+    tokens = []
+    cur = []
+    quoted = False
+    quote = None
+    qbuf = []
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote is not None:
+            if ch == "\\" and i + 1 < len(line):
+                qbuf.append(ch)
+                qbuf.append(line[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                cur.append(decode_escapes("".join(qbuf)))
+                qbuf = []
+                quote = None
+                i += 1
+                continue
+            qbuf.append(ch)
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            quoted = True
+            i += 1
+            continue
+        if ch in ("{", "}"):
+            if cur or quoted:
+                tokens.append(Token("".join(cur), quoted))
+                cur = []
+                quoted = False
+            tokens.append(Token(ch))
+            i += 1
+            continue
+        if ch.isspace():
+            if cur or quoted:
+                tokens.append(Token("".join(cur), quoted))
+                cur = []
+                quoted = False
+            i += 1
+            continue
+        cur.append(ch)
+        i += 1
+    if qbuf:
+        # Unterminated quote: decode what was gathered and keep it.
+        cur.append(decode_escapes("".join(qbuf)))
+    if cur or quoted:
+        tokens.append(Token("".join(cur), quoted))
+    return tokens
+
+
+def logical_lines(path):
+    """Yield (lineno, text) logical lines of a config file:
+    physical lines joined on backslash-newline continuation. The
+    line number reported is the first physical line of the logical
+    line. Returns (lines, byte_count)."""
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        raw = fh.read()
+    phys = raw.split("\n")
+    if phys and phys[-1] == "":
+        phys.pop()
+    out = []
+    i = 0
+    while i < len(phys):
+        lineno = i + 1
+        text = phys[i]
+        while text.endswith("\\") and i + 1 < len(phys):
+            text = text[:-1] + phys[i + 1]
+            i += 1
+        out.append((lineno, text))
+        i += 1
+    return out, len(raw.encode("utf-8", errors="replace"))
+
+
+# ----------------------------------------------------------- brace expansion
+
+def _brace_split(inner):
+    """Split the inside of one {...} group on top-level commas
+    (nested braces do not split)."""
+    parts = []
+    depth = 0
+    cur = []
+    for ch in inner:
+        if ch == "{":
+            depth += 1
+            cur.append(ch)
+        elif ch == "}":
+            depth -= 1
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
+def _find_brace_group(pattern):
+    """Return (start, end, inner) of the first top-level {...}
+    group in pattern, or None. Unbalanced braces yield None."""
+    depth = 0
+    start = None
+    for i, ch in enumerate(pattern):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                return start, i, pattern[start + 1:i]
+            if depth < 0:
+                return None
+    return None
+
+
+def expand_braces(pattern):
+    """Csh-style brace expansion [documented -- keepalived.conf(5):
+    include patterns may use brace expressions such as
+    "{foo/{,cat,dog},bar}" if glob() supports them]. Python's glob
+    does not expand braces, so this is the tool's own job (KV02):
+    nested braces and empty alternatives are supported. An
+    unbalanced brace group is left as-is (glob then treats it as
+    a literal, matching nothing)."""
+    group = _find_brace_group(pattern)
+    if group is None:
+        return [pattern]
+    start, end, inner = group
+    out = []
+    for alt in _brace_split(inner):
+        expanded = pattern[:start] + alt + pattern[end + 1:]
+        out.extend(expand_braces(expanded))
+    return out
+
+
+def first_level_alternatives(pattern):
+    """The patterns produced by expanding only the outermost brace
+    group once (used for the brace_match check, KV03: each brace
+    alternative must match a file)."""
+    group = _find_brace_group(pattern)
+    if group is None:
+        return [pattern]
+    start, end, inner = group
+    return [pattern[:start] + alt + pattern[end + 1:]
+            for alt in _brace_split(inner)]
+
+# ------------------------------------------------------------------ loader
+
+INCLUDE_VARIANTS = {
+    "include": set(),
+    "includer": {"readable"},
+    "includem": {"match"},
+    "includew": {"wildcard_match"},
+    "includeb": {"brace_match"},
+    "includea": {"readable", "match", "wildcard_match",
+                 "brace_match"},
+}
+ALL_CHECKS = {"readable", "match", "wildcard_match", "brace_match"}
+
+
+class MergedLine:
+    """One logical line of the merged include stream, with
+    provenance. `raw` keeps the original text (comments included);
+    the parser strips comments per line so that ${_HASH}/${_BANG}
+    substitution cannot create a comment (KV06)."""
+    __slots__ = ("file", "lineno", "raw")
+
+    def __init__(self, file, lineno, raw):
+        self.file = file
+        self.lineno = lineno
+        self.raw = raw
+
+    @property
+    def where(self):
+        return "%s:%d" % (self.file, self.lineno)
+
+
+class Loader:
+    """Loads config files into one merged logical-line stream,
+    expanding includes in place (KV02) under the include_check
+    level stack (KV03). Include detection runs on the raw line
+    before @-conditional and $ substitution processing (KV04),
+    so an @-prefixed include or a $-pattern include is never
+    followed. include_check lines are consumed here, in stream
+    order, because the level they set governs the includes that
+    follow them in the same file."""
+
+    def __init__(self, config_id):
+        self.config_id = config_id
+        self.lines = []            # [MergedLine] in load order
+        self.files = []            # {"path","bytes","lines",
+                                   #  "included_from"}
+        self.expansions = []       # include directives, with
+                                   # variant + effective level
+        self.findings = []
+        self.unfollowed = []       # {"where","pattern","reason"}
+        self.check_level = set()   # current include_check level
+        self._level_stack = []
+        self._stack = []           # abspaths currently loading
+
+    def load(self, paths):
+        for path in paths:
+            self._load_one(path, 0, None, top=True)
+        return self.lines
+
+    # -- level handling ------------------------------------------------
+
+    def _apply_include_check(self, tokens, where):
+        """Apply an `include_check [OPTIONS]` line to the current
+        level (KV03). Bare options replace the level with exactly
+        those options; `+opt` adds, `-opt` removes; no option at
+        all means all options. Unknown options are findings."""
+        opts = [t.text for t in tokens[1:]]
+        if not opts:
+            self.check_level = set(ALL_CHECKS)
+            return
+        bare = [o for o in opts if not o.startswith(("+", "-"))]
+        if bare:
+            new_level = set()
+            for o in bare:
+                if o not in ALL_CHECKS:
+                    self.findings.append(Finding(
+                        "KV03", "finding",
+                        "unknown include_check option %r" % o,
+                        where))
+                else:
+                    new_level.add(o)
+            self.check_level = new_level
+        for o in opts:
+            if o.startswith("+"):
+                name = o[1:]
+                if name not in ALL_CHECKS:
+                    self.findings.append(Finding(
+                        "KV03", "finding",
+                        "unknown include_check option %r" % o,
+                        where))
+                else:
+                    self.check_level.add(name)
+            elif o.startswith("-"):
+                name = o[1:]
+                if name not in ALL_CHECKS:
+                    self.findings.append(Finding(
+                        "KV03", "finding",
+                        "unknown include_check option %r" % o,
+                        where))
+                else:
+                    self.check_level.discard(name)
+
+    def _gate_of_at_line(self, tokens):
+        """Gate of a line whose first token is `@WORD` or `@^WORD`
+        (KV05). Returns (gate, rest_tokens) or (None, None) when
+        the @ is malformed. `gate` is one of UNGATED,
+        GATED_INCLUDED, GATED_UNKNOWN, or "dropped"."""
+        first = tokens[0].text
+        if len(first) < 2 or first[1:2] == " ":
+            return None, None
+        neg = first.startswith("@^")
+        word = first[2:] if neg else first[1:]
+        if not word:
+            return None, None
+        if self.config_id is None:
+            return GATED_UNKNOWN, tokens[1:]
+        matched = (word == self.config_id)
+        if neg:
+            matched = not matched
+        return (GATED_INCLUDED if matched else "dropped"), \
+            tokens[1:]
+
+    # -- file loading --------------------------------------------------
+
+    def _load_one(self, path, depth, included_from, top=False):
+        if depth > MAX_INCLUDE_DEPTH:
+            raise FatalConfig(
+                "include depth exceeded (cap is %d levels, KV02)"
+                % MAX_INCLUDE_DEPTH, where=path)
+        abspath = os.path.abspath(path)
+        if abspath in self._stack:
+            chain = " -> ".join(self._stack + [abspath])
+            raise FatalConfig(
+                "include cycle detected: %s (KV02)" % chain,
+                where=path)
+        try:
+            lines, nbytes = logical_lines(path)
+        except OSError as exc:
+            raise _ReadError("cannot read config file %s: %s"
+                             % (path, exc), where=path)
+        self.files.append({"path": path, "bytes": nbytes,
+                           "lines": len(lines),
+                           "included_from": included_from})
+        self._stack.append(abspath)
+        # The include_check level is saved on entry and restored
+        # on exit, so a level set inside an included file cannot
+        # leak out (KV03). Top-level --conf files share one
+        # stream, so they do not save/restore against each other.
+        saved = None
+        if not top:
+            saved = set(self.check_level)
+            self._level_stack.append(saved)
+        try:
+            base_dir = os.path.dirname(abspath)
+            for lineno, text in lines:
+                self._load_line(text, path, lineno, base_dir, depth)
+        finally:
+            self._stack.pop()
+            if not top:
+                self.check_level = self._level_stack.pop()
+
+    def _load_line(self, text, path, lineno, base_dir, depth):
+        where = "%s:%d" % (path, lineno)
+        stripped = strip_comment(text)
+        tokens = tokenize(stripped)
+        if not tokens:
+            return
+        first = tokens[0].text
+        # include_check lines are consumed in stream order: the
+        # level governs the includes that follow in this file.
+        if first == "include_check":
+            self._apply_include_check(tokens, where)
+            return
+        if first.startswith("@") and len(tokens) >= 2 and \
+                tokens[1].text == "include_check":
+            gate, _rest = self._gate_of_at_line(tokens)
+            if gate is None:
+                self.findings.append(Finding(
+                    "KV21", "finding",
+                    "malformed @ conditional on include_check line "
+                    "(KV05)", where))
+                return
+            if gate == GATED_UNKNOWN:
+                self.findings.append(Finding(
+                    "KV05", "finding",
+                    "@-gated include_check line: the effective "
+                    "include_check level for later includes is "
+                    "[gated-unknown] without --config-id; level "
+                    "left unchanged", where))
+                return
+            if gate == GATED_INCLUDED:
+                self._apply_include_check(tokens[1:], where)
+            return
+        # @-prefixed include lines are not followed (KV04): the
+        # include detector runs before conditional processing.
+        if first.startswith("@") and len(tokens) >= 2 and \
+                tokens[1].text in INCLUDE_VARIANTS:
+            pattern = tokens[2].text if len(tokens) > 2 else ""
+            self.unfollowed.append({
+                "where": where, "pattern": pattern,
+                "reason": "@-prefixed include line is not followed "
+                          "(include detection runs before @ "
+                          "conditional processing, KV04)"})
+            self.findings.append(Finding(
+                "KV04", "finding",
+                "@-prefixed include %r is not followed; its "
+                "contents are unknown to this tool (KV04)"
+                % pattern, where))
+            return
+        if first in INCLUDE_VARIANTS:
+            self._do_include(first, tokens[1:], base_dir, depth,
+                             where)
+            return
+        self.lines.append(MergedLine(path, lineno, text))
+
+    # -- includes ------------------------------------------------------
+
+    def _do_include(self, variant, arg_tokens, base_dir, depth,
+                    where):
+        if not arg_tokens:
+            self.findings.append(Finding(
+                "KV21", "warning",
+                "%s directive with no file argument" % variant,
+                where))
+            return
+        pattern = arg_tokens[0].text
+        if len(arg_tokens) > 1:
+            self.findings.append(Finding(
+                "KV21", "finding",
+                "%s line has extra tokens after the filename "
+                "(one filename per include line, KV02); using %r"
+                % (variant, pattern), where))
+        if "$" in pattern:
+            # Include detection runs before parameter
+            # substitution (KV04): the pattern is not followed
+            # even when the parameter is defined.
+            self.unfollowed.append({
+                "where": where, "pattern": pattern,
+                "reason": "include pattern contains $PARAM "
+                          "reference; include detection runs before "
+                          "substitution, so the pattern is not "
+                          "followed (KV04)"})
+            self.findings.append(Finding(
+                "KV04", "finding",
+                "include pattern %r contains a $PARAM reference "
+                "and is not followed (KV04)" % pattern, where))
+            return
+        effective = set(self.check_level) | INCLUDE_VARIANTS[variant]
+        self.expansions.append({
+            "where": where, "variant": variant, "pattern": pattern,
+            "level": sorted(effective), "matches": []})
+        expansion = self.expansions[-1]
+        if not os.path.isabs(pattern):
+            self.findings.append(Finding(
+                "KV02", "info",
+                "relative include %r resolved against the "
+                "including file's directory %s (the daemon's "
+                "working directory is not the base, KV02)"
+                % (pattern, base_dir), where))
+        # brace_match: every first-level brace alternative must
+        # match at least one file (KV03).
+        if "brace_match" in effective and "{" in pattern:
+            for alt in first_level_alternatives(pattern):
+                if not self._expand_one(alt, base_dir):
+                    raise FatalConfig(
+                        "include %s: brace alternative %r matched "
+                        "no file (brace_match, KV03)"
+                        % (variant, alt), where=where)
+        all_matches = []
+        for expanded in expand_braces(pattern):
+            matches = self._expand_one(expanded, base_dir)
+            if glob.has_magic(expanded):
+                if "wildcard_match" in effective and not matches:
+                    raise FatalConfig(
+                        "include %s: wildcard pattern %r matched "
+                        "no files (wildcard_match, KV03)"
+                        % (variant, expanded), where=where)
+            else:
+                if "match" in effective and not matches:
+                    raise FatalConfig(
+                        "include %s: %r matched no file "
+                        "(match, KV03)" % (variant, expanded),
+                        where=where)
+            all_matches.extend(matches)
+        # Deduplicate within one directive (overlapping brace
+        # alternatives may match the same file); the daemon would
+        # read it twice, which would manufacture duplicate
+        # declarations, so one read per directive is the honest
+        # reading [design rule].
+        seen = set()
+        matches = []
+        for m in all_matches:
+            if m not in seen:
+                seen.add(m)
+                matches.append(m)
+        expansion["matches"] = matches
+        if not matches:
+            # Plain `include` silently tolerates a missing file
+            # (KV03): a warning, and the verdict stands over the
+            # files that did load.
+            self.findings.append(Finding(
+                "KV03", "warning",
+                "%s %r matched no files; plain include tolerates "
+                "this (warning only, KV03)" % (variant, pattern),
+                where))
+            return
+        for match in matches:
+            if not os.path.isabs(match):
+                match = os.path.join(base_dir, match)
+            try:
+                self._load_one(match, depth + 1, where)
+            except _ReadError as exc:
+                if "readable" in effective:
+                    raise FatalConfig(
+                        "include %s: matched file %r is not "
+                        "readable (readable check, KV03)"
+                        % (variant, match), where=where)
+                self.findings.append(Finding(
+                    "KV03", "warning",
+                    "include %s: matched file %r could not be "
+                    "read (%s); plain include tolerates this "
+                    "(KV03)" % (variant, match, exc.message),
+                    where))
+
+    def _expand_one(self, pattern, base_dir):
+        """Glob one (brace-expanded) pattern against the including
+        file's directory, returning matches in byte-wise sorted
+        order (KV02: glob(3P) sorts by default; the C-locale
+        reading is pinned and bannered in coverage)."""
+        if not os.path.isabs(pattern):
+            pattern = os.path.join(base_dir, pattern)
+        if glob.has_magic(pattern):
+            return sorted(glob.glob(pattern))
+        return [pattern] if os.path.exists(pattern) else []
+
+# ------------------------------------------------------------------ model
+
+class VipEntry:
+    """One address line inside virtual_ipaddress[_excluded]."""
+    __slots__ = ("address", "mask", "raw", "options", "where",
+                 "gate", "excluded", "instance")
+
+    def __init__(self, address, mask, raw, options, where, gate,
+                 excluded, instance):
+        self.address = address      # ipaddress object
+        self.mask = mask            # int or None
+        self.raw = raw              # address token as written
+        self.options = options      # {name: value-or-True}
+        self.where = where
+        self.gate = gate
+        self.excluded = excluded
+        self.instance = instance    # owning Instance or None
+
+
+class Instance:
+    __slots__ = ("name", "where", "gate", "state", "interface",
+                 "vrid", "priority", "advert_int", "nopreempt",
+                 "preempt", "preempt_delay", "accept", "version",
+                 "use_vmac", "use_ipvlan", "unicast_src_ip",
+                 "unicast_peers", "mcast_src_ip", "vips", "track",
+                 "no_virtual_ipaddress", "auth_type", "auth_pass",
+                 "auth_hmac_keys", "sync_groups", "unparseable")
+
+    def __init__(self, name, where, gate):
+        self.name = name            # None when the name is
+                                    # gated-unknown/unresolvable
+        self.where = where
+        self.gate = gate
+        self.state = None
+        self.interface = None
+        self.vrid = None
+        self.priority = None
+        self.advert_int = None
+        self.nopreempt = False
+        self.preempt = None
+        self.preempt_delay = None
+        self.accept = None
+        self.version = None
+        self.use_vmac = False
+        self.use_ipvlan = False
+        self.unicast_src_ip = None
+        self.unicast_peers = []
+        self.mcast_src_ip = None
+        self.vips = []
+        self.track = []             # (kind, name, weight, where)
+        self.no_virtual_ipaddress = False
+        self.auth_type = None
+        self.auth_pass = False      # presence only, never the value
+        self.auth_hmac_keys = []    # key ids only, never values
+        self.sync_groups = []       # SyncGroup objects (finalize)
+        self.unparseable = []       # where strings of unparseable
+                                    # lines inside this instance
+
+
+class RealServer:
+    __slots__ = ("address", "port", "weight", "where", "gate",
+                 "checkers")
+
+    def __init__(self, address, port, where, gate):
+        self.address = address
+        self.port = port
+        self.weight = None
+        self.where = where
+        self.gate = gate
+        self.checkers = []          # checker block keywords
+
+
+class VirtualServer:
+    __slots__ = ("form", "address", "port", "fwmark", "group_name",
+                 "where", "gate", "protocol", "lvs_sched",
+                 "lvs_method", "persistence_timeout", "quorum",
+                 "real_servers", "sorry_servers", "unparseable")
+
+    def __init__(self, form, where, gate):
+        self.form = form            # "ip" | "fwmark" | "group"
+        self.address = None
+        self.port = None
+        self.fwmark = None
+        self.group_name = None
+        self.where = where
+        self.gate = gate
+        self.protocol = None        # None means the TCP default
+        self.lvs_sched = None
+        self.lvs_method = None
+        self.persistence_timeout = None
+        self.quorum = None
+        self.real_servers = []
+        self.sorry_servers = []     # (address, port, where)
+        self.unparseable = []
+
+
+class GroupMember:
+    """One member line of a virtual_server_group."""
+    __slots__ = ("kind", "low", "high", "port", "raw", "where",
+                 "gate", "fwmark")
+
+    def __init__(self, kind, low, high, port, raw, where, gate,
+                 fwmark=None):
+        self.kind = kind            # "ip" | "range" | "fwmark"
+        self.low = low              # int (first address) or None
+        self.high = high            # int (last address) or None
+        self.port = port
+        self.raw = raw              # member text as written
+        self.where = where
+        self.gate = gate
+        self.fwmark = fwmark
+
+    def contains(self, ip):
+        if self.kind == "fwmark":
+            return False
+        n = int(ip)
+        return self.low <= n <= self.high
+
+
+class ServerGroup:
+    __slots__ = ("name", "where", "gate", "members", "unparseable")
+
+    def __init__(self, name, where, gate):
+        self.name = name
+        self.where = where
+        self.gate = gate
+        self.members = []
+        self.unparseable = []
+
+
+class SyncGroup:
+    __slots__ = ("name", "where", "gate", "members", "track")
+
+    def __init__(self, name, where, gate):
+        self.name = name
+        self.where = where
+        self.gate = gate
+        self.members = []           # (instance name, where)
+        self.track = []
+
+
+class ScriptDef:
+    __slots__ = ("name", "where", "gate", "script", "interval",
+                 "weight")
+
+    def __init__(self, name, where, gate):
+        self.name = name
+        self.where = where
+        self.gate = gate
+        self.script = None
+        self.interval = None
+        self.weight = None
+
+
+class StaticEntry:
+    __slots__ = ("address", "mask", "raw", "where", "gate")
+
+    def __init__(self, address, mask, raw, where, gate):
+        self.address = address
+        self.mask = mask
+        self.raw = raw
+        self.where = where
+        self.gate = gate
+
+
+class Param:
+    __slots__ = ("value", "gate", "where")
+
+    def __init__(self, value, gate, where):
+        self.value = value
+        self.gate = gate
+        self.where = where
+
+
+class Model:
+    """Everything the parser extracted, plus the loader's
+    findings and the blockers that can poison a verdict."""
+    def __init__(self, loader, config_id):
+        self.loader = loader
+        self.config_id = config_id
+        self.findings = list(loader.findings)
+        self.instances = []
+        self.virtual_servers = []
+        self.groups = []
+        self.sync_groups = []
+        self.scripts = []           # ScriptDef objects
+        self.static_entries = []
+        self.script_inventory = []  # {"class","path","where"}
+        self.seq_lines = []         # {"where","gate","text"}
+        self.random_lines = []      # {"where","gate","text"}
+        self.gated_lines = []       # {"where","gate"}
+        self.unfollowed = list(loader.unfollowed)
+        self.unparseable = []       # {"where","scope","message"}
+        self.gated_candidates = []  # {"kind","where","message"}
+        self.blockers = []          # {"kind","where","message"}
+        self.skipped_lines = 0
+        self.static_routes = 0
+        self.static_rules = 0
+        self.virtual_routes = 0
+        self.virtual_rules = 0
+        self.instances_by_name = {}
+        self.groups_by_name = {}
+        self.scripts_by_name = {}
+        self.vip_by_address = {}
+        self.duplicate_instances = {}
+        self.duplicate_groups = {}
+        self.duplicate_vs = {}
+        self.vrid_collisions = []
+
+    # -- blocker helpers ---------------------------------------------
+
+    def add_blocker(self, kind, where, message):
+        self.blockers.append({"kind": kind, "where": where,
+                              "message": message})
+
+    def add_gated_candidate(self, kind, where, message, name=None):
+        self.gated_candidates.append({"kind": kind, "where": where,
+                                      "message": message,
+                                      "name": name})
+
+    def add_unparseable(self, where, scope, message):
+        self.unparseable.append({"where": where, "scope": scope,
+                                 "message": message})
+        self.findings.append(Finding(
+            "KV21", "finding",
+            "unparseable line: %s" % message, where))
+
+    def global_blockers(self):
+        """Blockers that can poison any declaration query: an
+        unfollowed include (KV04) or a ${_RANDOM} declaration
+        line (KV06). ~SEQ/~LST lines are scoped separately
+        (seq_blockers_for), because what they could generate
+        depends on the remainder of the line (KV07)."""
+        out = []
+        for u in self.unfollowed:
+            out.append({"kind": "unfollowed-include",
+                        "where": u["where"],
+                        "message": u["reason"]})
+        for b in self.blockers:
+            out.append(b)
+        return out
+
+    def seq_blockers_for(self, kinds):
+        """~SEQ/~LST lines that could generate an answer of one
+        of the given kinds. A line whose kind is 'unknown' could
+        generate anything, so it is included in every set."""
+        out = []
+        for s in self.seq_lines:
+            if s.get("kind") in kinds or \
+                    s.get("kind") == "unknown":
+                out.append({
+                    "kind": "seq", "where": s["where"],
+                    "message": "~SEQ/~LST line could generate "
+                               "the queried declaration "
+                               "([seq-unknown], KV07)"})
+        return out
+
+    # -- finalize ------------------------------------------------------
+
+    def finalize(self):
+        for inst in self.instances:
+            if inst.name is not None:
+                self.instances_by_name.setdefault(
+                    inst.name, []).append(inst)
+        for grp in self.groups:
+            if grp.name is not None:
+                self.groups_by_name.setdefault(
+                    grp.name, []).append(grp)
+        for sc in self.scripts:
+            if sc.name is not None:
+                self.scripts_by_name.setdefault(
+                    sc.name, []).append(sc)
+        for inst in self.instances:
+            for vip in inst.vips:
+                self.vip_by_address.setdefault(
+                    vip.address, []).append((inst, vip))
+        self.duplicate_instances = {
+            n: v for n, v in self.instances_by_name.items()
+            if len(v) > 1}
+        self.duplicate_groups = {
+            n: v for n, v in self.groups_by_name.items()
+            if len(v) > 1}
+        vs_by_key = {}
+        for vs in self.virtual_servers:
+            if vs.form != "ip" or vs.address is None:
+                continue
+            key = (vs.address, vs.port,
+                   vs.protocol or "TCP")
+            vs_by_key.setdefault(key, []).append(vs)
+        self.duplicate_vs = {k: v for k, v in vs_by_key.items()
+                             if len(v) > 1}
+        # Sync-group membership + dangling members (KV14).
+        for sg in self.sync_groups:
+            for name, where in sg.members:
+                if name not in self.instances_by_name:
+                    self.findings.append(Finding(
+                        "KV14", "finding",
+                        "vrrp_sync_group %s names instance %r "
+                        "which is never defined (dangling "
+                        "reference)" % (sg.name, name), where))
+                else:
+                    for inst in self.instances_by_name[name]:
+                        if sg not in inst.sync_groups:
+                            inst.sync_groups.append(sg)
+        # Dangling vrrp_script references (KV15).
+        for inst in self.instances:
+            for kind, name, _w, where in inst.track:
+                if kind == "track_script" and \
+                        name not in self.scripts_by_name:
+                    self.findings.append(Finding(
+                        "KV15", "finding",
+                        "track_script %r in instance %s is never "
+                        "defined as a vrrp_script (dangling "
+                        "reference)" % (name, inst.name), where))
+        for sg in self.sync_groups:
+            for kind, name, _w, where in sg.track:
+                if kind == "track_script" and \
+                        name not in self.scripts_by_name:
+                    self.findings.append(Finding(
+                        "KV15", "finding",
+                        "track_script %r in sync group %s is "
+                        "never defined as a vrrp_script (dangling "
+                        "reference)" % (name, sg.name), where))
+        # Same VRID + interface + address family (KV13): a
+        # warning, not an AMBIGUOUS verdict.
+        for i, a in enumerate(self.instances):
+            for b in self.instances[i + 1:]:
+                if a.interface is None or b.interface is None:
+                    continue
+                if a.interface != b.interface:
+                    continue
+                if a.vrid is None or b.vrid is None:
+                    continue
+                if a.vrid != b.vrid:
+                    continue
+                fa = {v.address.version for v in a.vips}
+                fb = {v.address.version for v in b.vips}
+                if fa and fb and not (fa & fb):
+                    continue
+                self.vrid_collisions.append((a, b))
+                self.findings.append(Finding(
+                    "KV13", "finding",
+                    "instances %s (%s) and %s (%s) share VRID %d "
+                    "on interface %s (the man page warns "
+                    "duplicating a virtual_router_id on the same "
+                    "interface has been known to cause problems "
+                    "with some network switches)"
+                    % (a.name, a.where, b.name, b.where, a.vrid,
+                       a.interface), a.where))
+        # Same-protocol virtual_servers sharing one group (KV12):
+        # a finding, not AMBIGUOUS.
+        for grp in self.groups:
+            if grp.name is None:
+                continue
+            users = [vs for vs in self.virtual_servers
+                     if vs.form == "group" and
+                     vs.group_name == grp.name]
+            if not users:
+                self.findings.append(Finding(
+                    "KV12", "finding",
+                    "virtual_server_group %s is defined but no "
+                    "virtual_server uses it" % grp.name, grp.where))
+                continue
+            by_proto = {}
+            for vs in users:
+                by_proto.setdefault(vs.protocol or "TCP",
+                                    []).append(vs)
+            for proto, vss in by_proto.items():
+                if len(vss) > 1:
+                    self.findings.append(Finding(
+                        "KV12", "finding",
+                        "%d %s virtual_servers use group %s (the "
+                        "man page says do not configure more than "
+                        "one TCP, one UDP and one SCTP virtual "
+                        "server with the same address family using "
+                        "the same virtual server group)"
+                        % (len(vss), proto, grp.name),
+                        vss[0].where))
+        # Empty instances (KV23).
+        for inst in self.instances:
+            if not inst.vips:
+                if inst.no_virtual_ipaddress:
+                    self.findings.append(Finding(
+                        "KV23", "finding",
+                        "instance %s has no VIPs; "
+                        "no_virtual_ipaddress is set (the daemon "
+                        "suppresses its no-VIP warning for this "
+                        "instance)" % inst.name, inst.where))
+                else:
+                    self.findings.append(Finding(
+                        "KV23", "warning",
+                        "instance %s has no VIPs and "
+                        "no_virtual_ipaddress is not set (the "
+                        "daemon warns about an instance with no "
+                        "VIPs)" % inst.name, inst.where))
+
+# ----------------------------------------------------------------- parser
+
+AT_RE = re.compile(r"^(\s*)@(\^?)([^\s]+)\s*(.*)$", re.DOTALL)
+PARAM_DEF_RE = re.compile(r"^\s*\$([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+BRACED_USE_RE = re.compile(r"(?<!\\)\$\{([A-Za-z_][A-Za-z0-9_]*)([^}]*)\}")
+BARE_USE_RE = re.compile(r"(?<!\\)\$([A-Za-z_][A-Za-z0-9_]*)(?=\s|$)")
+
+TOP_BLOCKS = {
+    "global_defs", "vrrp_instance", "vrrp_sync_group",
+    "vrrp_script", "virtual_server", "virtual_server_group",
+    "static_ipaddress", "static_routes", "static_rules", "bfd",
+    "garp_group", "linkbeat_interfaces", "lvs_sync_daemon",
+    "vrrp_mcast_group4", "vrrp_mcast_group6",
+}
+INSTANCE_SUBBLOCKS = {
+    "virtual_ipaddress", "virtual_ipaddress_excluded",
+    "virtual_routes", "virtual_rules", "track_interface",
+    "track_script", "track_file", "track_process", "track_bfd",
+    "unicast_peer", "authentication", "auth_hmac",
+}
+INSTANCE_DIRECTIVES = {
+    "state", "interface", "virtual_router_id", "priority",
+    "advert_int", "nopreempt", "preempt", "preempt_delay",
+    "accept", "no_accept", "unicast_src_ip", "mcast_src_ip",
+    "use_vmac", "use_ipvlan", "version", "dont_track_primary",
+    "garp_master_delay", "garp_master_refresh",
+    "garp_master_repeat", "garp_backup_delay", "smtp_alert",
+    "notify", "notify_master", "notify_backup", "notify_fault",
+    "notify_stop", "notify_master_rx", "notify_backup_rx",
+    "notify_fault_rx", "notify_stop_rx", "vrrp_mcast_group4",
+    "vrrp_mcast_group6", "no_virtual_ipaddress",
+}
+NOTIFY_KEYWORDS = {
+    "notify", "notify_master", "notify_backup", "notify_fault",
+    "notify_stop", "notify_master_rx", "notify_backup_rx",
+    "notify_fault_rx", "notify_stop_rx",
+}
+VS_DIRECTIVES = {
+    "lvs_sched", "lvs_method", "protocol", "persistence_timeout",
+    "persistence_granularity", "virtualhost", "alpha", "omega",
+    "quorum", "quorum_up", "quorum_down", "sorry_server",
+    "delay_loop", "lb_algo", "lb_kind", "inhibit_on_failure",
+}
+CHECKERS = {
+    "HTTP_GET", "TCP_CHECK", "MISC_CHECK", "SSL_GET",
+    "DNS_CHECK", "SMTP_CHECK", "UDP_CHECK", "PING_CHECK",
+    "FILE_CHECK", "BFD_CHECK",
+}
+REAL_SERVER_DIRECTIVES = {
+    "weight", "inhibit_on_failure", "notify_up", "notify_down",
+}
+SYNCGROUP_DIRECTIVES = {
+    "notify", "notify_master", "notify_backup", "notify_fault",
+    "notify_stop", "smtp_alert",
+}
+SYNCGROUP_SUBBLOCKS = {
+    "group", "track_interface", "track_script", "track_file",
+    "track_process", "track_bfd",
+}
+SCRIPT_DIRECTIVES = {
+    "script", "interval", "weight", "rise", "fall", "timeout",
+    "user", "group",
+}
+TRACK_KINDS = {
+    "track_interface", "track_script", "track_file",
+    "track_process", "track_bfd",
+}
+VIP_VALUE_OPTS = {"brd", "dev", "scope", "label", "peer",
+                  "preferred_lft"}
+VIP_FLAG_OPTS = {"use_vmac", "home", "-nodad", "mngtmpaddr",
+                 "noprefixroute", "autojoin", "no_track"}
+EXCLUDED_VALUE_OPTS = {"brd", "dev", "scope", "label", "peer"}
+EXCLUDED_FLAG_OPTS = {"home", "-nodad", "mngtmpaddr",
+                      "noprefixroute", "autojoin", "no_track"}
+SKIP_FRAME_KINDS = {
+    "global_defs", "bfd", "garp_group", "linkbeat_interfaces",
+    "lvs_sync_daemon", "vrrp_mcast_group4", "vrrp_mcast_group6",
+    "unknown", "skip",
+}
+
+
+class Frame:
+    __slots__ = ("kind", "gate", "obj", "where", "name")
+
+    def __init__(self, kind, gate, obj=None, where=None, name=None):
+        self.kind = kind
+        self.gate = gate
+        self.obj = obj
+        self.where = where
+        self.name = name
+
+
+class Parser:
+    """Parses the merged include stream into the Model: @-gating
+    (KV05), $PARAM substitution (KV06), ~SEQ/~LST (KV07), the
+    block model (KV09-KV16), and unparseable-line scoping (KV21).
+    """
+
+    def __init__(self, model, config_id):
+        self.model = model
+        self.config_id = config_id
+        self.params = {}
+        self.stack = []
+
+    # -- top level -----------------------------------------------------
+
+    def parse(self, lines):
+        for ml in lines:
+            self._process_line(ml)
+        for frame in self.stack:
+            if frame.kind == "dropped":
+                continue
+            self.model.findings.append(Finding(
+                "KV21", "finding",
+                "unclosed block %s opened at %s (brace imbalance; "
+                "contents kept as best effort, KV08/KV21)"
+                % (frame.kind, frame.where), frame.where))
+
+    def _in_dropped(self):
+        return bool(self.stack) and \
+            self.stack[-1].kind == "dropped"
+
+    def _frame_gate(self):
+        return self.stack[-1].gate if self.stack else UNGATED
+
+    def _scope(self):
+        """The unparseable-line scope of the current position
+        (KV21): the innermost modeled declaration the line sits
+        in, or ("toplevel", None)."""
+        for frame in reversed(self.stack):
+            if frame.kind in ("vip", "vip_excluded"):
+                return ("vip", frame.name)
+            if frame.kind == "group":
+                return ("group_member", frame.name)
+            if frame.kind in ("vs", "real_server", "checker"):
+                return ("vs", frame.name)
+            if frame.kind == "instance":
+                return ("instance", frame.name)
+            if frame.kind == "syncgroup":
+                return ("syncgroup", frame.name)
+            if frame.kind == "script":
+                return ("script", frame.name)
+            if frame.kind == "static_ip":
+                return ("static", None)
+        return ("toplevel", None)
+
+    def _unparseable(self, ctx, message):
+        """Record an unparseable line. A gated-unknown line that
+        could be a declaration of the queried kind becomes a
+        gated-unknown candidate (KV17); anything else is a scoped
+        UNKNOWN poison (KV21) or a warning-only finding."""
+        scope = self._scope()
+        if ctx["gate"] == GATED_UNKNOWN:
+            kind = {"vip": "vip", "group_member": "group_member",
+                    "vs": "vs", "instance": "instance"}.get(scope[0])
+            if kind is not None:
+                self.model.add_gated_candidate(
+                    kind, ctx["where"],
+                    "gated-unknown line in %s scope could be the "
+                    "queried declaration: %s"
+                    % (scope[0], message),
+                    name=scope[1])
+                return
+            self.model.findings.append(Finding(
+                "KV21", "finding",
+                "gated-unknown unparseable line (cannot change a "
+                "verdict from this scope): %s" % message,
+                ctx["where"]))
+            return
+        self.model.add_unparseable(ctx["where"], scope, message)
+
+    # -- per-line processing -------------------------------------------
+
+    def _at_gate(self, word, neg):
+        if self.config_id is None:
+            return GATED_UNKNOWN
+        matched = (word == self.config_id)
+        if neg:
+            matched = not matched
+        return GATED_INCLUDED if matched else "dropped"
+
+    def _process_line(self, ml):
+        where = ml.where
+        if self._in_dropped():
+            self._brace_walk_tokens(
+                tokenize(strip_comment(ml.raw)), where)
+            return
+        stripped = strip_comment(ml.raw)
+        if not stripped.strip():
+            return
+        gate = self._frame_gate()
+        content = stripped
+        if stripped.lstrip().startswith("@"):
+            m = AT_RE.match(stripped)
+            if m is None or not m.group(3):
+                self._unparseable(
+                    {"where": where, "gate": gate,
+                     "has_random": False},
+                    "line starts with '@' but has no conditional "
+                    "word immediately after '@' (KV05)")
+                return
+            line_gate = self._at_gate(m.group(3),
+                                      m.group(2) == "^")
+            self.model.gated_lines.append(
+                {"where": where, "gate": line_gate})
+            if line_gate == "dropped":
+                self._brace_walk_tokens(
+                    tokenize(strip_comment(m.group(4))), where)
+                return
+            gate = combine_gate(gate, line_gate)
+            content = m.group(4)
+            if not content.strip():
+                return
+        cstrip = content.lstrip()
+        if cstrip.startswith("~SEQ(") or cstrip.startswith("~LST("):
+            self.model.seq_lines.append(
+                {"where": where, "gate": gate,
+                 "kind": self._seq_kind(cstrip),
+                 "text": cstrip.split("\n")[0]})
+            self.model.findings.append(Finding(
+                "KV07", "finding",
+                "%s line is not expanded in v1 ([seq-unknown], "
+                "KV07); a query whose answer could lie in "
+                "generated lines is UNKNOWN"
+                % cstrip[:5], where))
+            return
+        dm = PARAM_DEF_RE.match(content)
+        if dm:
+            name, value = dm.group(1), dm.group(2)
+            if name.startswith("_"):
+                self.model.findings.append(Finding(
+                    "KV06", "finding",
+                    "parameter $%s is pre-defined and cannot be "
+                    "redefined; definition ignored" % name, where))
+            else:
+                self.params[name] = Param(value, gate, where)
+            return
+        text, used_gated, has_random = self._substitute(
+            content, ml.file, where)
+        if used_gated:
+            gate = GATED_UNKNOWN
+        if has_random:
+            self.model.random_lines.append(
+                {"where": where, "gate": gate, "text": text.strip()})
+        tokens = tokenize(text)
+        if not tokens:
+            return
+        ctx = {"where": where, "gate": gate,
+               "has_random": has_random, "file": ml.file}
+        self._process_tokens(tokens, ctx)
+
+    def _seq_kind(self, cstrip):
+        """What kind of declaration a ~SEQ/~LST line could
+        generate (KV07), from the remainder after the
+        ~SEQ(var, ...) / ~LST(var, ...) prefix. A generated
+        block header implies generated block contents (the man
+        page's 65,024-instance example), so a header remainder
+        is classified by the block kind; anything
+        unclassifiable is 'unknown' (a global blocker)."""
+        depth = 0
+        idx = len(cstrip)
+        for i, ch in enumerate(cstrip):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    idx = i + 1
+                    break
+        remainder = cstrip[idx:].strip()
+        if not remainder:
+            return "unknown"
+        toks = tokenize(remainder)
+        if not toks:
+            return "unknown"
+        first = toks[0].text
+        if "{" in remainder or first in TOP_BLOCKS or \
+                first in INSTANCE_SUBBLOCKS or \
+                first == "real_server" or first in CHECKERS:
+            if first == "vrrp_instance":
+                return "instance"
+            if first == "virtual_server":
+                return "vs"
+            if first == "virtual_server_group":
+                return "group"
+            if first == "vrrp_sync_group":
+                return "syncgroup"
+            return "unknown"
+        if first == "fwmark":
+            return "group_member"
+        # An IP-ish line: a VIP entry (in a virtual_ipaddress
+        # block) or a group member (in a virtual_server_group).
+        if "." in first or ":" in first or "-" in first or \
+                "/" in first:
+            frame = self.stack[-1] if self.stack else None
+            if frame is not None and frame.kind == "group":
+                return "group_member"
+            return "vip"
+        return "unknown"
+
+    # -- substitution (KV06) -------------------------------------------
+
+    def _subst_once(self, text, file):
+        changed = False
+        used_gated = False
+        has_random = False
+
+        def repl_braced(m):
+            nonlocal changed, used_gated, has_random
+            name = m.group(1)
+            if name == "_RANDOM":
+                has_random = True
+                return m.group(0)
+            if name == "_PWD":
+                changed = True
+                return os.path.dirname(os.path.abspath(file))
+            if name == "_INSTANCE":
+                if self.config_id is None:
+                    used_gated = True
+                    return m.group(0)
+                changed = True
+                return self.config_id
+            if name == "_HASH":
+                changed = True
+                return "#"
+            if name == "_BANG":
+                changed = True
+                return "!"
+            param = self.params.get(name)
+            if param is None:
+                return m.group(0)  # undefined: left as-is
+            if param.gate == GATED_UNKNOWN:
+                used_gated = True
+                return m.group(0)
+            changed = True
+            return param.value
+
+        def repl_bare(m):
+            nonlocal changed, used_gated, has_random
+            name = m.group(1)
+            if name == "_RANDOM":
+                has_random = True
+                return m.group(0)
+            if name == "_PWD":
+                changed = True
+                return os.path.dirname(os.path.abspath(file))
+            if name == "_INSTANCE":
+                if self.config_id is None:
+                    used_gated = True
+                    return m.group(0)
+                changed = True
+                return self.config_id
+            if name == "_HASH":
+                changed = True
+                return "#"
+            if name == "_BANG":
+                changed = True
+                return "!"
+            param = self.params.get(name)
+            if param is None:
+                return m.group(0)
+            if param.gate == GATED_UNKNOWN:
+                used_gated = True
+                return m.group(0)
+            changed = True
+            return param.value
+
+        text = BRACED_USE_RE.sub(repl_braced, text)
+        text = BARE_USE_RE.sub(repl_bare, text)
+        return text, changed, used_gated, has_random
+
+    def _substitute(self, content, file, where):
+        text = content
+        used_gated = False
+        has_random = False
+        for _ in range(MAX_SUBST_PASSES):
+            text, changed, gated, random_ = self._subst_once(
+                text, file)
+            used_gated = used_gated or gated
+            has_random = has_random or random_
+            if not changed:
+                break
+        else:
+            self.model.findings.append(Finding(
+                "KV06", "finding",
+                "parameter substitution did not converge after %d "
+                "passes (recursive definition?); line left as-is"
+                % MAX_SUBST_PASSES, where))
+        return text, used_gated, has_random
+
+    # -- brace handling --------------------------------------------------
+
+    def _brace_walk_tokens(self, tokens, where):
+        """Brace tracking only (dropped lines/blocks, KV05/KV17):
+        a `{` opens a dropped frame, a `}` closes one."""
+        for tok in tokens:
+            if tok.text == "{":
+                self.stack.append(Frame(
+                    "dropped", UNGATED, where=where))
+            elif tok.text == "}":
+                if self.stack:
+                    self.stack.pop()
+                else:
+                    self.model.findings.append(Finding(
+                        "KV21", "finding",
+                        "unmatched '}' with no open block "
+                        "(KV08/KV21)", where))
+
+    @staticmethod
+    def _split_braces(tokens):
+        segments = []
+        cur = []
+        for tok in tokens:
+            if tok.text == "{":
+                segments.append((cur, "{"))
+                cur = []
+            elif tok.text == "}":
+                segments.append((cur, "}"))
+                cur = []
+            else:
+                cur.append(tok)
+        if cur:
+            segments.append((cur, None))
+        return segments
+
+    def _process_tokens(self, tokens, ctx):
+        for seg_tokens, brace in self._split_braces(tokens):
+            if brace == "{":
+                self._open_block(seg_tokens, ctx)
+            elif brace == "}":
+                if seg_tokens:
+                    self._directive(seg_tokens, ctx)
+                self._close_block(ctx)
+            else:
+                self._directive(seg_tokens, ctx)
+
+    def _close_block(self, ctx):
+        if not self.stack:
+            self.model.findings.append(Finding(
+                "KV21", "finding",
+                "unmatched '}' with no open block (KV08/KV21)",
+                ctx["where"]))
+            return
+        self.stack.pop()
+
+    # -- block headers ---------------------------------------------------
+
+    def _open_block(self, header, ctx):
+        if not header:
+            self.model.findings.append(Finding(
+                "KV08", "finding",
+                "lone '{' with no block header (KV08: a block "
+                "header is KEYWORD args { on one logical line); "
+                "contents skipped", ctx["where"]))
+            self.stack.append(Frame(
+                "skip", ctx["gate"], where=ctx["where"]))
+            return
+        kw = header[0].text
+        args = header[1:]
+        if ctx["has_random"]:
+            # The header's identity is non-deterministic (KV06):
+            # its declarations cannot be matched.
+            self.model.add_blocker(
+                "random", ctx["where"],
+                "block header contains ${_RANDOM}; its "
+                "declarations cannot be matched ([random-unknown], "
+                "KV06)")
+            self.stack.append(Frame(
+                "skip", ctx["gate"], where=ctx["where"]))
+            return
+        frame = self.stack[-1] if self.stack else None
+        kind = frame.kind if frame else None
+        if kind is None:
+            self._open_top_block(kw, args, ctx)
+        elif kind == "instance":
+            self._open_instance_block(kw, args, ctx, frame.obj)
+        elif kind == "vs":
+            self._open_vs_block(kw, args, ctx, frame.obj)
+        elif kind == "real_server":
+            self._open_real_server_block(kw, args, ctx, frame.obj)
+        elif kind == "syncgroup":
+            self._open_syncgroup_block(kw, args, ctx, frame.obj)
+        elif kind == "checker":
+            # Checker bodies are unmodeled (KV15): any nested
+            # block inside one (e.g. HTTP_GET's `url { ... }`)
+            # is skipped cleanly, never poison.
+            self.stack.append(Frame(
+                "skip", ctx["gate"], where=ctx["where"], name=kw))
+        else:
+            self._unparseable(
+                ctx, "unexpected block %r inside %s (KV21)"
+                % (kw, kind))
+            self.stack.append(Frame(
+                "skip", ctx["gate"], where=ctx["where"], name=kw))
+
+    def _open_top_block(self, kw, args, ctx):
+        where = ctx["where"]
+        gate = ctx["gate"]
+        if kw == "global_defs":
+            self.stack.append(Frame(
+                "global_defs", gate, where=where))
+            return
+        if kw in ("static_routes", "static_rules"):
+            self.stack.append(Frame(kw, gate, where=where))
+            return
+        if kw in ("bfd", "garp_group", "linkbeat_interfaces",
+                  "lvs_sync_daemon", "vrrp_mcast_group4",
+                  "vrrp_mcast_group6"):
+            self.stack.append(Frame(
+                "skip", gate, where=where, name=kw))
+            return
+        if kw == "vrrp_instance":
+            name = self._block_name(args, ctx, "instance_header")
+            inst = Instance(name, where, gate)
+            self.model.instances.append(inst)
+            self.stack.append(Frame(
+                "instance", gate, obj=inst, where=where, name=name))
+            return
+        if kw == "vrrp_sync_group":
+            name = self._block_name(args, ctx, "syncgroup")
+            sg = SyncGroup(name, where, gate)
+            self.model.sync_groups.append(sg)
+            self.stack.append(Frame(
+                "syncgroup", gate, obj=sg, where=where, name=name))
+            return
+        if kw == "vrrp_script":
+            name = self._block_name(args, ctx, "script")
+            sc = ScriptDef(name, where, gate)
+            self.model.scripts.append(sc)
+            self.stack.append(Frame(
+                "script", gate, obj=sc, where=where, name=name))
+            return
+        if kw == "virtual_server":
+            vs = self._parse_vs_header(args, ctx)
+            if vs is None:
+                self.stack.append(Frame(
+                    "skip", gate, where=where, name=kw))
+                return
+            self.model.virtual_servers.append(vs)
+            vs_id = self._vs_id(vs)
+            self.stack.append(Frame(
+                "vs", gate, obj=vs, where=where, name=vs_id))
+            return
+        if kw == "virtual_server_group":
+            name = self._block_name(args, ctx, "group_header")
+            grp = ServerGroup(name, where, gate)
+            self.model.groups.append(grp)
+            self.stack.append(Frame(
+                "group", gate, obj=grp, where=where, name=name))
+            return
+        if kw == "static_ipaddress":
+            self.stack.append(Frame(
+                "static_ip", gate, where=where))
+            return
+        self._unparseable(
+            ctx, "unknown top-level block keyword %r (KV21)" % kw)
+        self.stack.append(Frame(
+            "unknown", gate, where=where, name=kw))
+
+    @staticmethod
+    def _vs_id(vs):
+        if vs.form == "ip" and vs.address is not None:
+            return "%s%s" % (vs.address,
+                             (":%d" % vs.port)
+                             if vs.port is not None else "")
+        if vs.form == "fwmark":
+            return "fwmark %s" % vs.fwmark
+        if vs.form == "group":
+            return "group %s" % vs.group_name
+        return vs.where
+
+    def _block_name(self, args, ctx, header_scope):
+        """The single name argument of a block header. Returns the
+        name, or None when it is gated-unknown/unresolvable (a
+        gated-unknown candidate is recorded) or missing
+        (unparseable, scope header_scope)."""
+        where = ctx["where"]
+        if not args:
+            self.model.add_unparseable(
+                where, (header_scope, None),
+                "block header with no name (KV21)")
+            return None
+        if len(args) > 1:
+            self.model.add_unparseable(
+                where, (header_scope, None),
+                "block header has extra tokens after the name "
+                "(KV21)")
+        name = args[0].text
+        if "$" in name:
+            if ctx["gate"] == GATED_UNKNOWN:
+                self.model.add_gated_candidate(
+                    {"instance_header": "instance",
+                     "syncgroup": "syncgroup",
+                     "script": "script",
+                     "group_header": "group"}.get(
+                        header_scope, "instance"),
+                    where,
+                    "block name contains an unresolvable $ "
+                    "reference under a gated-unknown gate (KV06)",
+                    name=None)
+                return None
+            self.model.add_unparseable(
+                where, (header_scope, None),
+                "block name %r contains an unresolvable $ "
+                "reference (KV06/KV21)" % name)
+            return None
+        return name
+
+    def _parse_vs_header(self, args, ctx):
+        where = ctx["where"]
+        if not args:
+            self.model.add_unparseable(
+                where, ("vs_header", None),
+                "virtual_server with no address, fwmark or group "
+                "(KV11)")
+            return None
+        first = args[0].text
+        if first == "fwmark":
+            if len(args) != 2 or not args[1].text.isdigit():
+                self.model.add_unparseable(
+                    where, ("vs_header", None),
+                    "fwmark virtual_server needs exactly one "
+                    "integer mark (KV11)")
+                return None
+            vs = VirtualServer("fwmark", where, ctx["gate"])
+            vs.fwmark = int(args[1].text)
+            return vs
+        if first == "group":
+            if len(args) != 2:
+                self.model.add_unparseable(
+                    where, ("vs_header", None),
+                    "virtual_server group needs exactly one group "
+                    "name (KV11)")
+                return None
+            if "$" in args[1].text:
+                if ctx["gate"] == GATED_UNKNOWN:
+                    self.model.add_gated_candidate(
+                        "vs", where,
+                        "virtual_server group name contains an "
+                        "unresolvable $ reference under a "
+                        "gated-unknown gate (KV06)")
+                    vs = VirtualServer("group", where, ctx["gate"])
+                    return vs
+                self.model.add_unparseable(
+                    where, ("vs_header", None),
+                    "virtual_server group name contains an "
+                    "unresolvable $ reference (KV06/KV21)")
+                return None
+            vs = VirtualServer("group", where, ctx["gate"])
+            vs.group_name = args[1].text
+            return vs
+        if "$" in first:
+            if ctx["gate"] == GATED_UNKNOWN:
+                self.model.add_gated_candidate(
+                    "vs", where,
+                    "virtual_server address contains an "
+                    "unresolvable $ reference under a "
+                    "gated-unknown gate (KV06)")
+                return VirtualServer("ip", where, ctx["gate"])
+            self.model.add_unparseable(
+                where, ("vs_header", None),
+                "virtual_server address %r contains an "
+                "unresolvable $ reference (KV06/KV21)" % first)
+            return None
+        try:
+            ip = ipaddress.ip_address(first)
+        except ValueError:
+            self.model.add_unparseable(
+                where, ("vs_header", None),
+                "virtual_server address %r is not a valid IP "
+                "address (KV11)" % first)
+            return None
+        port = None
+        if len(args) > 1:
+            if len(args) > 2 or not args[1].text.isdigit() or \
+                    not 0 <= int(args[1].text) <= 65535:
+                self.model.add_unparseable(
+                    where, ("vs_header", None),
+                    "virtual_server port %r is not a valid port "
+                    "(KV11)" % (args[1].text if len(args) > 1
+                                else ""))
+                return None
+            port = int(args[1].text)
+        vs = VirtualServer("ip", where, ctx["gate"])
+        vs.address = ip
+        vs.port = port
+        return vs
+
+    def _open_instance_block(self, kw, args, ctx, inst):
+        where = ctx["where"]
+        gate = ctx["gate"]
+        if kw == "virtual_ipaddress":
+            self.stack.append(Frame(
+                "vip", gate, obj=inst, where=where,
+                name=inst.name))
+            return
+        if kw == "virtual_ipaddress_excluded":
+            self.stack.append(Frame(
+                "vip_excluded", gate, obj=inst, where=where,
+                name=inst.name))
+            return
+        if kw in ("virtual_routes", "virtual_rules"):
+            self.stack.append(Frame(kw, gate, where=where))
+            return
+        if kw in TRACK_KINDS:
+            self.stack.append(Frame(
+                "track", gate, obj=inst, where=where, name=kw))
+            return
+        if kw == "unicast_peer":
+            self.stack.append(Frame(
+                "unicast_peer", gate, obj=inst, where=where))
+            return
+        if kw == "authentication":
+            self.stack.append(Frame(
+                "auth", gate, obj=inst, where=where))
+            return
+        if kw == "auth_hmac":
+            self.stack.append(Frame(
+                "auth_hmac", gate, obj=inst, where=where))
+            return
+        self._unparseable(
+            ctx, "unexpected block %r inside vrrp_instance "
+            "(KV21)" % kw)
+        self.stack.append(Frame(
+            "skip", gate, where=where, name=kw))
+
+    def _open_vs_block(self, kw, args, ctx, vs):
+        where = ctx["where"]
+        gate = ctx["gate"]
+        if kw == "real_server":
+            rs = self._parse_real_server(args, ctx, vs)
+            if rs is None:
+                self.stack.append(Frame(
+                    "skip", gate, where=where, name=kw))
+                return
+            vs.real_servers.append(rs)
+            self.stack.append(Frame(
+                "real_server", gate, obj=rs, where=where,
+                name=self._vs_id(vs)))
+            return
+        self._unparseable(
+            ctx, "unexpected block %r inside virtual_server "
+            "(KV21)" % kw)
+        self.stack.append(Frame(
+            "skip", gate, where=where, name=kw))
+
+    def _parse_real_server(self, args, ctx, vs):
+        where = ctx["where"]
+        if not args:
+            self.model.add_unparseable(
+                where, ("vs", self._vs_id(vs)),
+                "real_server with no address (KV11)")
+            return None
+        first = args[0].text
+        if "$" in first:
+            if ctx.get("has_random") and "_RANDOM" in first:
+                self.model.add_blocker(
+                    "random", ctx["where"],
+                    "real_server address contains ${_RANDOM}; it "
+                    "cannot be matched ([random-unknown], KV06)")
+                return None
+            if ctx["gate"] == GATED_UNKNOWN:
+                self.model.add_gated_candidate(
+                    "vs", where,
+                    "real_server address contains an unresolvable "
+                    "$ reference under a gated-unknown gate (KV06)")
+                return RealServer(None, None, where, ctx["gate"])
+            self.model.add_unparseable(
+                where, ("vs", self._vs_id(vs)),
+                "real_server address %r contains an unresolvable "
+                "$ reference (KV06/KV21)" % first)
+            return None
+        try:
+            ip = ipaddress.ip_address(first)
+        except ValueError:
+            self.model.add_unparseable(
+                where, ("vs", self._vs_id(vs)),
+                "real_server address %r is not a valid IP address "
+                "(KV11)" % first)
+            return None
+        port = None
+        if len(args) > 1:
+            if len(args) > 2 or not args[1].text.isdigit() or \
+                    not 0 <= int(args[1].text) <= 65535:
+                self.model.add_unparseable(
+                    where, ("vs", self._vs_id(vs)),
+                    "real_server port %r is not a valid port "
+                    "(KV11)" % (args[1].text if len(args) > 1
+                                else ""))
+                return None
+            port = int(args[1].text)
+        return RealServer(ip, port, where, ctx["gate"])
+
+    def _open_real_server_block(self, kw, args, ctx, rs):
+        where = ctx["where"]
+        gate = ctx["gate"]
+        if kw in CHECKERS:
+            rs.checkers.append(kw)
+            self.stack.append(Frame(
+                "checker", gate, obj=rs, where=where, name=kw))
+            return
+        self._unparseable(
+            ctx, "unexpected block %r inside real_server (KV21)"
+            % kw)
+        self.stack.append(Frame(
+            "skip", gate, where=where, name=kw))
+
+    def _open_syncgroup_block(self, kw, args, ctx, sg):
+        where = ctx["where"]
+        gate = ctx["gate"]
+        if kw == "group":
+            self.stack.append(Frame(
+                "group_block", gate, obj=sg, where=where))
+            return
+        if kw in TRACK_KINDS:
+            self.stack.append(Frame(
+                "track", gate, obj=sg, where=where, name=kw))
+            return
+        self._unparseable(
+            ctx, "unexpected block %r inside vrrp_sync_group "
+            "(KV21)" % kw)
+        self.stack.append(Frame(
+            "skip", gate, where=where, name=kw))
+
+    # -- directive lines ---------------------------------------------------
+
+    def _directive(self, tokens, ctx):
+        if not self.stack:
+            self._unparseable(
+                ctx, "top-level line %r is not a known block "
+                "keyword (KV21)" % tokens[0].text)
+            return
+        frame = self.stack[-1]
+        kind = frame.kind
+        if kind == "instance":
+            self._directive_instance(tokens, ctx, frame.obj)
+        elif kind == "vs":
+            self._directive_vs(tokens, ctx, frame.obj)
+        elif kind == "group":
+            self._directive_group_member(tokens, ctx, frame.obj)
+        elif kind == "syncgroup":
+            self._directive_syncgroup(tokens, ctx, frame.obj)
+        elif kind == "script":
+            self._directive_script(tokens, ctx, frame.obj)
+        elif kind == "static_ip":
+            self._directive_static(tokens, ctx)
+        elif kind in ("vip", "vip_excluded"):
+            self._directive_vip(tokens, ctx, frame.obj,
+                                kind == "vip_excluded")
+        elif kind == "track":
+            self._directive_track(tokens, ctx, frame)
+        elif kind == "unicast_peer":
+            self._directive_unicast_peer(tokens, ctx, frame.obj)
+        elif kind == "auth":
+            self._directive_auth(tokens, ctx, frame.obj)
+        elif kind == "auth_hmac":
+            self._directive_auth_hmac(tokens, ctx, frame.obj)
+        elif kind == "checker":
+            self._directive_checker(tokens, ctx)
+        elif kind == "real_server":
+            self._directive_real_server(tokens, ctx, frame.obj)
+        elif kind == "group_block":
+            self._directive_group_block(tokens, ctx, frame.obj)
+        elif kind == "global_defs":
+            if tokens[0].text in ("startup_script",
+                                  "shutdown_script"):
+                if len(tokens) >= 2:
+                    self.model.script_inventory.append({
+                        "class": tokens[0].text,
+                        "path": tokens[1].text,
+                        "where": ctx["where"]})
+            self.model.skipped_lines += 1
+        elif kind in SKIP_FRAME_KINDS:
+            self.model.skipped_lines += 1
+        elif kind == "virtual_routes":
+            self.model.virtual_routes += 1
+        elif kind == "virtual_rules":
+            self.model.virtual_rules += 1
+        elif kind == "static_routes":
+            self.model.static_routes += 1
+        elif kind == "static_rules":
+            self.model.static_rules += 1
+        else:
+            self.model.skipped_lines += 1
+
+    def _need_value(self, tokens, ctx, kw, what):
+        """A directive that takes exactly one value. Returns the
+        value or None (unparseable recorded, or the value is
+        [gated-unknown]/[random-unknown] and the field is simply
+        left unknown -- KV05/KV06 -- which is not a parse
+        defect)."""
+        if len(tokens) != 2:
+            self._unparseable(
+                ctx, "%s needs exactly one %s (KV21)"
+                % (kw, what))
+            return None
+        val = tokens[1].text
+        if "$" in val and (ctx["gate"] == GATED_UNKNOWN or
+                           ctx.get("has_random")):
+            return None
+        return val
+
+    def _need_int(self, tokens, ctx, kw, lo, hi):
+        val = self._need_value(tokens, ctx, kw, "integer value")
+        if val is None:
+            return None
+        if not val.lstrip("-").isdigit():
+            self._unparseable(
+                ctx, "%s value %r is not an integer (KV21)"
+                % (kw, val))
+            return None
+        n = int(val)
+        if not lo <= n <= hi:
+            self._unparseable(
+                ctx, "%s value %d is outside %d-%d (KV21)"
+                % (kw, n, lo, hi))
+            return None
+        return n
+
+    def _need_ip(self, tokens, ctx, kw):
+        val = self._need_value(tokens, ctx, kw, "IP address")
+        if val is None:
+            return None
+        try:
+            return ipaddress.ip_address(val)
+        except ValueError:
+            self._unparseable(
+                ctx, "%s value %r is not a valid IP address "
+                "(KV21)" % (kw, val))
+            return None
+
+    # -- vrrp_instance directives ------------------------------------------
+
+    def _directive_instance(self, tokens, ctx, inst):
+        kw = tokens[0].text
+        if kw in INSTANCE_SUBBLOCKS:
+            self._unparseable(
+                ctx, "%s is a block keyword and needs '{' (KV21)"
+                % kw)
+            return
+        if kw == "state":
+            val = self._need_value(tokens, ctx, kw, "state")
+            if val is None:
+                return
+            if val not in ("MASTER", "BACKUP"):
+                self._unparseable(
+                    ctx, "state must be MASTER or BACKUP, got %r "
+                    "(KV09/KV21)" % val)
+                return
+            inst.state = val
+        elif kw == "interface":
+            val = self._need_value(tokens, ctx, kw, "interface")
+            if val is not None:
+                inst.interface = val
+        elif kw == "virtual_router_id":
+            n = self._need_int(tokens, ctx, kw, 1, 255)
+            if n is not None:
+                inst.vrid = n
+        elif kw == "priority":
+            n = self._need_int(tokens, ctx, kw, 1, 255)
+            if n is not None:
+                inst.priority = n
+        elif kw == "advert_int":
+            val = self._need_value(tokens, ctx, kw, "interval")
+            if val is None:
+                return
+            try:
+                inst.advert_int = float(val)
+            except ValueError:
+                self._unparseable(
+                    ctx, "advert_int value %r is not a number "
+                    "(KV21)" % val)
+        elif kw == "nopreempt":
+            if len(tokens) != 1:
+                self._unparseable(
+                    ctx, "nopreempt takes no value (KV21)")
+                return
+            inst.nopreempt = True
+        elif kw == "preempt":
+            if len(tokens) != 1:
+                self._unparseable(
+                    ctx, "preempt takes no value (KV21)")
+                return
+            inst.preempt = True
+        elif kw == "preempt_delay":
+            n = self._need_int(tokens, ctx, kw, 0, 1000000)
+            if n is not None:
+                inst.preempt_delay = n
+        elif kw == "accept":
+            if len(tokens) != 1:
+                self._unparseable(ctx, "accept takes no value "
+                                  "(KV21)")
+                return
+            inst.accept = True
+        elif kw == "no_accept":
+            if len(tokens) != 1:
+                self._unparseable(ctx, "no_accept takes no value "
+                                  "(KV21)")
+                return
+            inst.accept = False
+        elif kw == "version":
+            val = self._need_value(tokens, ctx, kw, "version")
+            if val is None:
+                return
+            if val not in ("2", "3"):
+                self._unparseable(
+                    ctx, "version must be 2 or 3, got %r (KV21)"
+                    % val)
+                return
+            inst.version = int(val)
+        elif kw == "use_vmac":
+            if len(tokens) != 1:
+                self._unparseable(ctx, "use_vmac takes no value "
+                                  "(KV21)")
+                return
+            inst.use_vmac = True
+        elif kw == "use_ipvlan":
+            if len(tokens) != 1:
+                self._unparseable(ctx, "use_ipvlan takes no value "
+                                  "(KV21)")
+                return
+            inst.use_ipvlan = True
+        elif kw == "unicast_src_ip":
+            ip = self._need_ip(tokens, ctx, kw)
+            if ip is not None:
+                inst.unicast_src_ip = ip
+        elif kw == "mcast_src_ip":
+            ip = self._need_ip(tokens, ctx, kw)
+            if ip is not None:
+                inst.mcast_src_ip = ip
+        elif kw == "no_virtual_ipaddress":
+            if len(tokens) != 1:
+                self._unparseable(
+                    ctx, "no_virtual_ipaddress takes no value "
+                    "(KV21)")
+                return
+            inst.no_virtual_ipaddress = True
+        elif kw == "dont_track_primary":
+            if len(tokens) != 1:
+                self._unparseable(
+                    ctx, "dont_track_primary takes no value "
+                    "(KV21)")
+                return
+        elif kw in NOTIFY_KEYWORDS:
+            if len(tokens) < 2:
+                self._unparseable(
+                    ctx, "%s needs a script path (KV15/KV21)" % kw)
+                return
+            self.model.script_inventory.append({
+                "class": "notify", "path": tokens[1].text,
+                "where": ctx["where"]})
+        elif kw in ("garp_master_delay", "garp_master_refresh",
+                    "garp_master_repeat", "garp_backup_delay",
+                    "smtp_alert", "vrrp_mcast_group4",
+                    "vrrp_mcast_group6"):
+            # Recognized-but-unevaluated instance knobs (KV21):
+            # parsed-or-skipped cleanly, never poison.
+            return
+        else:
+            self._unparseable(
+                ctx, "unknown keyword %r in vrrp_instance (KV21)"
+                % kw)
+
+    # -- virtual_server directives -----------------------------------------
+
+    def _directive_vs(self, tokens, ctx, vs):
+        kw = tokens[0].text
+        if kw == "real_server":
+            self._unparseable(
+                ctx, "real_server is a block keyword and needs "
+                "'{' (KV21)")
+            return
+        if kw == "lvs_sched":
+            val = self._need_value(tokens, ctx, kw, "scheduler")
+            if val is not None:
+                vs.lvs_sched = val
+        elif kw == "lvs_method":
+            val = self._need_value(tokens, ctx, kw, "method")
+            if val is not None:
+                vs.lvs_method = val
+        elif kw == "protocol":
+            val = self._need_value(tokens, ctx, kw, "protocol")
+            if val is None:
+                return
+            if val not in ("TCP", "UDP", "SCTP"):
+                self._unparseable(
+                    ctx, "protocol must be TCP, UDP or SCTP, got "
+                    "%r (KV11/KV21)" % val)
+                return
+            vs.protocol = val
+        elif kw == "persistence_timeout":
+            n = self._need_int(tokens, ctx, kw, 0, 1000000)
+            if n is not None:
+                vs.persistence_timeout = n
+        elif kw == "persistence_granularity":
+            ip = self._need_ip(tokens, ctx, kw)
+        elif kw == "virtualhost":
+            self._need_value(tokens, ctx, kw, "hostname")
+        elif kw in ("alpha", "omega"):
+            if len(tokens) != 1:
+                self._unparseable(
+                    ctx, "%s takes no value (KV21)" % kw)
+        elif kw == "quorum":
+            n = self._need_int(tokens, ctx, kw, 0, 1000000)
+            if n is not None:
+                vs.quorum = n
+        elif kw in ("quorum_up", "quorum_down"):
+            if len(tokens) < 2:
+                self._unparseable(
+                    ctx, "%s needs a script path (KV15/KV21)" % kw)
+                return
+            self.model.script_inventory.append({
+                "class": "quorum", "path": tokens[1].text,
+                "where": ctx["where"]})
+        elif kw == "sorry_server":
+            if len(tokens) < 2 or len(tokens) > 3:
+                self._unparseable(
+                    ctx, "sorry_server needs an IP address and "
+                    "optional port (KV11/KV21)")
+                return
+            try:
+                ip = ipaddress.ip_address(tokens[1].text)
+            except ValueError:
+                self._unparseable(
+                    ctx, "sorry_server address %r is not a valid "
+                    "IP address (KV11/KV21)" % tokens[1].text)
+                return
+            port = None
+            if len(tokens) == 3:
+                if not tokens[2].text.isdigit() or \
+                        not 0 <= int(tokens[2].text) <= 65535:
+                    self._unparseable(
+                        ctx, "sorry_server port %r is not a valid "
+                        "port (KV11/KV21)" % tokens[2].text)
+                    return
+                port = int(tokens[2].text)
+            vs.sorry_servers.append((ip, port, ctx["where"]))
+        elif kw in ("delay_loop", "lb_algo", "lb_kind",
+                    "inhibit_on_failure"):
+            return
+        else:
+            self._unparseable(
+                ctx, "unknown keyword %r in virtual_server (KV21)"
+                % kw)
+
+    # -- address lines (VIP / static) ---------------------------------------
+
+    def _parse_address_line(self, tokens, ctx, excluded):
+        """Parse one address line (KV10). Returns
+        (ip, mask, options) or None (unparseable recorded)."""
+        first = tokens[0].text
+        if "$" in first:
+            if ctx.get("has_random") and "_RANDOM" in first:
+                self.model.add_blocker(
+                    "random", ctx["where"],
+                    "VIP address contains ${_RANDOM}; the address "
+                    "cannot be matched ([random-unknown], KV06)")
+                return None
+            if ctx["gate"] == GATED_UNKNOWN:
+                self.model.add_gated_candidate(
+                    "vip", ctx["where"],
+                    "VIP address contains an unresolvable $ "
+                    "reference under a gated-unknown gate (KV06)")
+            else:
+                self._unparseable(
+                    ctx, "VIP address %r contains an unresolvable "
+                    "$ reference (KV06/KV21)" % first)
+            return None
+        addr_s, mask = first, None
+        if "/" in first:
+            addr_s, _, mask_s = first.partition("/")
+            if not mask_s.isdigit():
+                self._unparseable(
+                    ctx, "VIP address %r has a non-numeric mask "
+                    "(KV10/KV21)" % first)
+                return None
+            mask = int(mask_s)
+        try:
+            ip = ipaddress.ip_address(addr_s)
+        except ValueError:
+            self._unparseable(
+                ctx, "VIP address %r is not a valid IP address "
+                "(KV10/KV21)" % first)
+            return None
+        if mask is not None and not (
+                0 <= mask <= (32 if ip.version == 4 else 128)):
+            self._unparseable(
+                ctx, "VIP address %r has a mask out of range "
+                "(KV10/KV21)" % first)
+            return None
+        value_opts = EXCLUDED_VALUE_OPTS if excluded \
+            else VIP_VALUE_OPTS
+        flag_opts = EXCLUDED_FLAG_OPTS if excluded \
+            else VIP_FLAG_OPTS
+        options = {}
+        i = 1
+        while i < len(tokens):
+            tok = tokens[i].text
+            if tok in value_opts:
+                if i + 1 >= len(tokens):
+                    self._unparseable(
+                        ctx, "VIP option %r needs a value "
+                        "(KV10/KV21)" % tok)
+                    return None
+                options[tok] = tokens[i + 1].text
+                i += 2
+            elif tok in flag_opts:
+                options[tok] = True
+                i += 1
+            else:
+                self._unparseable(
+                    ctx, "unrecognized token %r in VIP entry "
+                    "(KV10/KV21)" % tok)
+                return None
+        return ip, mask, options
+
+    def _directive_vip(self, tokens, ctx, instance, excluded):
+        parsed = self._parse_address_line(tokens, ctx, excluded)
+        if parsed is None:
+            return
+        ip, mask, options = parsed
+        if instance is not None:
+            instance.vips.append(VipEntry(
+                ip, mask, tokens[0].text, options, ctx["where"],
+                ctx["gate"], excluded, instance))
+
+    def _directive_static(self, tokens, ctx):
+        parsed = self._parse_address_line(tokens, ctx, False)
+        if parsed is None:
+            return
+        ip, mask, _options = parsed
+        self.model.static_entries.append(StaticEntry(
+            ip, mask, tokens[0].text, ctx["where"], ctx["gate"]))
+
+    # -- virtual_server_group members (KV12) --------------------------------
+
+    def _directive_group_member(self, tokens, ctx, grp):
+        first = tokens[0].text
+        if first == "fwmark":
+            if len(tokens) < 2 or not tokens[1].text.isdigit() or \
+                    len(tokens) > 3 or (len(tokens) == 3 and
+                                        tokens[2].text not in
+                                        ("inet", "inet6")):
+                self._unparseable(
+                    ctx, "fwmark group member needs an integer "
+                    "mark and optional inet|inet6 (KV12/KV21)")
+                return
+            grp.members.append(GroupMember(
+                "fwmark", None, None, None,
+                " ".join(t.text for t in tokens), ctx["where"],
+                ctx["gate"], fwmark=int(tokens[1].text)))
+            return
+        if "$" in first:
+            if ctx.get("has_random") and "_RANDOM" in first:
+                self.model.add_blocker(
+                    "random", ctx["where"],
+                    "group member contains ${_RANDOM}; it cannot "
+                    "be matched ([random-unknown], KV06)")
+                return
+            if ctx["gate"] == GATED_UNKNOWN:
+                self.model.add_gated_candidate(
+                    "group_member", ctx["where"],
+                    "group member contains an unresolvable $ "
+                    "reference under a gated-unknown gate (KV06)")
+            else:
+                self._unparseable(
+                    ctx, "group member %r contains an "
+                    "unresolvable $ reference (KV06/KV21)" % first)
+            return
+        port = None
+        if len(tokens) > 1:
+            if len(tokens) > 2 or not tokens[1].text.isdigit() or \
+                    not 0 <= int(tokens[1].text) <= 65535:
+                self._unparseable(
+                    ctx, "group member port %r is not a valid "
+                    "port (KV12/KV21)"
+                    % (tokens[1].text if len(tokens) > 1 else ""))
+                return
+            port = int(tokens[1].text)
+        raw = " ".join(t.text for t in tokens)
+        if "/" in first:
+            try:
+                net = ipaddress.ip_network(first, strict=False)
+            except ValueError:
+                self._unparseable(
+                    ctx, "group member %r is not a valid CIDR "
+                    "range (KV12/KV21)" % first)
+                return
+            grp.members.append(GroupMember(
+                "range", int(net.network_address),
+                int(net.broadcast_address), port, raw,
+                ctx["where"], ctx["gate"]))
+            return
+        if "-" in first:
+            left, _, right = first.partition("-")
+            try:
+                low_ip = ipaddress.ip_address(left)
+            except ValueError:
+                self._unparseable(
+                    ctx, "group member range %r has an invalid "
+                    "start address (KV12/KV21)" % first)
+                return
+            if "." in right or ":" in right:
+                try:
+                    high_ip = ipaddress.ip_address(right)
+                except ValueError:
+                    self._unparseable(
+                        ctx, "group member range %r has an invalid "
+                        "end address (KV12/KV21)" % first)
+                    return
+                if high_ip.version != low_ip.version or \
+                        int(high_ip) < int(low_ip):
+                    self._unparseable(
+                        ctx, "group member range %r is reversed or "
+                        "mixes families (KV12/KV21)" % first)
+                    return
+                low, high = int(low_ip), int(high_ip)
+            else:
+                if not right.isdigit():
+                    self._unparseable(
+                        ctx, "group member range %r has an invalid "
+                        "end (KV12/KV21)" % first)
+                    return
+                n = int(right)
+                if low_ip.version == 4:
+                    if not 0 <= n <= 255:
+                        self._unparseable(
+                            ctx, "group member range %r has a last "
+                            "octet out of range (KV12/KV21)" % first)
+                        return
+                    low = int(low_ip)
+                    high = (low & 0xFFFFFF00) | n
+                else:
+                    if not 0 <= n <= 0xFFFF:
+                        self._unparseable(
+                            ctx, "group member range %r has a last "
+                            "hextet out of range (KV12/KV21)" % first)
+                        return
+                    low = int(low_ip)
+                    high = (low & ~0xFFFF) | n
+                if high < low:
+                    self._unparseable(
+                        ctx, "group member range %r is reversed "
+                        "(KV12/KV21)" % first)
+                    return
+            grp.members.append(GroupMember(
+                "range", low, high, port, raw, ctx["where"],
+                ctx["gate"]))
+            return
+        try:
+            ip = ipaddress.ip_address(first)
+        except ValueError:
+            self._unparseable(
+                ctx, "group member %r is not a valid IP address "
+                "(KV12/KV21)" % first)
+            return
+        grp.members.append(GroupMember(
+            "ip", int(ip), int(ip), port, raw, ctx["where"],
+            ctx["gate"]))
+
+    # -- remaining directive handlers ---------------------------------------
+
+    def _directive_syncgroup(self, tokens, ctx, sg):
+        kw = tokens[0].text
+        if kw in SYNCGROUP_SUBBLOCKS:
+            self._unparseable(
+                ctx, "%s is a block keyword and needs '{' (KV21)"
+                % kw)
+            return
+        if kw in NOTIFY_KEYWORDS:
+            if len(tokens) < 2:
+                self._unparseable(
+                    ctx, "%s needs a script path (KV15/KV21)" % kw)
+                return
+            self.model.script_inventory.append({
+                "class": "notify", "path": tokens[1].text,
+                "where": ctx["where"]})
+        elif kw == "smtp_alert":
+            return
+        else:
+            self._unparseable(
+                ctx, "unknown keyword %r in vrrp_sync_group "
+                "(KV21)" % kw)
+
+    def _directive_script(self, tokens, ctx, sc):
+        kw = tokens[0].text
+        if kw == "script":
+            if len(tokens) < 2:
+                self._unparseable(
+                    ctx, "script needs a path (KV15/KV21)")
+                return
+            sc.script = tokens[1].text
+            self.model.script_inventory.append({
+                "class": "vrrp_script", "path": tokens[1].text,
+                "where": ctx["where"]})
+        elif kw == "interval":
+            n = self._need_int(tokens, ctx, kw, 1, 1000000)
+            if n is not None:
+                sc.interval = n
+        elif kw == "weight":
+            n = self._need_int(tokens, ctx, kw, -1000, 1000)
+            if n is not None:
+                sc.weight = n
+        elif kw in ("rise", "fall", "timeout"):
+            self._need_int(tokens, ctx, kw, 0, 1000000)
+        elif kw in ("user", "group"):
+            self._need_value(tokens, ctx, kw, "name")
+        else:
+            self._unparseable(
+                ctx, "unknown keyword %r in vrrp_script (KV21)"
+                % kw)
+
+    def _directive_track(self, tokens, ctx, frame):
+        kind = frame.name
+        parent = frame.obj
+        if not tokens:
+            return
+        name = tokens[0].text
+        weight = None
+        if len(tokens) == 3 and tokens[1].text == "weight":
+            if not tokens[2].text.lstrip("-").isdigit():
+                self._unparseable(
+                    ctx, "track weight %r is not an integer "
+                    "(KV14/KV21)" % tokens[2].text)
+                return
+            weight = int(tokens[2].text)
+        elif len(tokens) != 1:
+            self._unparseable(
+                ctx, "track entry needs a name and optional "
+                "'weight N' (KV14/KV21)")
+            return
+        entry = (kind, name, weight, ctx["where"])
+        if isinstance(parent, Instance):
+            parent.track.append(entry)
+        elif isinstance(parent, SyncGroup):
+            parent.track.append(entry)
+
+    def _directive_unicast_peer(self, tokens, ctx, inst):
+        for tok in tokens:
+            try:
+                ip = ipaddress.ip_address(tok.text)
+            except ValueError:
+                self._unparseable(
+                    ctx, "unicast_peer address %r is not a valid "
+                    "IP address (KV09/KV21)" % tok.text)
+                return
+            inst.unicast_peers.append((ip, ctx["where"]))
+
+    def _directive_auth(self, tokens, ctx, inst):
+        kw = tokens[0].text
+        if kw == "auth_type":
+            val = self._need_value(tokens, ctx, kw, "type")
+            if val is None:
+                return
+            if val not in ("PASS", "AH"):
+                self._unparseable(
+                    ctx, "auth_type must be PASS or AH, got %r "
+                    "(KV09/KV21)" % val)
+                return
+            inst.auth_type = val
+        elif kw == "auth_pass":
+            # Presence only: the secret is never recorded (KV24).
+            if len(tokens) < 2:
+                self._unparseable(
+                    ctx, "auth_pass needs a value (KV09/KV21)")
+                return
+            inst.auth_pass = True
+        else:
+            # Other authentication lines are skipped cleanly.
+            return
+
+    def _directive_auth_hmac(self, tokens, ctx, inst):
+        kw = tokens[0].text
+        if kw == "key":
+            # `key <id> <algo> <secret>`: record the id only,
+            # never the secret (KV24).
+            if len(tokens) < 2:
+                self._unparseable(
+                    ctx, "auth_hmac key needs an id (KV24/KV21)")
+                return
+            inst.auth_hmac_keys.append(tokens[1].text)
+        else:
+            return
+
+    def _directive_checker(self, tokens, ctx):
+        if tokens[0].text == "misc_path":
+            if len(tokens) >= 2:
+                self.model.script_inventory.append({
+                    "class": "misc", "path": tokens[1].text,
+                    "where": ctx["where"]})
+        self.model.skipped_lines += 1
+
+    def _directive_real_server(self, tokens, ctx, rs):
+        kw = tokens[0].text
+        if kw in CHECKERS:
+            self._unparseable(
+                ctx, "%s is a block keyword and needs '{' (KV21)"
+                % kw)
+            return
+        if kw == "weight":
+            n = self._need_int(tokens, ctx, kw, 0, 1000000)
+            if n is not None:
+                rs.weight = n
+        elif kw in ("inhibit_on_failure",):
+            if len(tokens) != 1:
+                self._unparseable(
+                    ctx, "%s takes no value (KV21)" % kw)
+        elif kw in ("notify_up", "notify_down"):
+            if len(tokens) < 2:
+                self._unparseable(
+                    ctx, "%s needs a script path (KV15/KV21)" % kw)
+                return
+            self.model.script_inventory.append({
+                "class": "notify", "path": tokens[1].text,
+                "where": ctx["where"]})
+        else:
+            self._unparseable(
+                ctx, "unknown keyword %r in real_server (KV21)"
+                % kw)
+
+    def _directive_group_block(self, tokens, ctx, sg):
+        for tok in tokens:
+            sg.members.append((tok.text, ctx["where"]))
+
+# ------------------------------------------------------------ query engine
+
+def _is_ungated(gate):
+    return gate in (UNGATED, GATED_INCLUDED)
+
+
+def _dedup_findings(findings):
+    seen = set()
+    out = []
+    for f in findings:
+        key = (f.fid, f.severity, f.message, f.where)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f)
+    return out
+
+
+def _scoped_unparseable(model, scopes):
+    """Unparseable lines whose scope could hold the queried
+    declaration. `scopes` is a list of (kind, name-or-None); a
+    None name on either side matches any name of that kind."""
+    out = []
+    for u in model.unparseable:
+        kind, name = u["scope"]
+        for sk, sn in scopes:
+            if kind == sk and (sn is None or name is None or
+                               name == sn):
+                out.append(u)
+                break
+    return out
+
+
+def _gated_candidates_for(model, kinds, name=None):
+    out = []
+    for c in model.gated_candidates:
+        if c["kind"] not in kinds:
+            continue
+        if name is not None and c.get("name") is not None and \
+                c["name"] != name:
+            continue
+        out.append(c)
+    return out
+
+
+def _collision_instances(model):
+    ids = set()
+    for a, b in model.vrid_collisions:
+        ids.add(id(a))
+        ids.add(id(b))
+    return ids
+
+
+def _instance_context(inst):
+    return {
+        "state": inst.state,
+        "interface": inst.interface,
+        "virtual_router_id": inst.vrid,
+        "priority": inst.priority,
+        "advert_int": inst.advert_int,
+        "nopreempt": inst.nopreempt,
+        "preempt": inst.preempt,
+        "preempt_delay": inst.preempt_delay,
+        "accept": inst.accept,
+        "version": inst.version,
+        "use_vmac": inst.use_vmac,
+        "use_ipvlan": inst.use_ipvlan,
+        "unicast_src_ip": (str(inst.unicast_src_ip)
+                           if inst.unicast_src_ip else None),
+        "unicast_peers": [str(ip) for ip, _w in inst.unicast_peers],
+        "mcast_src_ip": (str(inst.mcast_src_ip)
+                         if inst.mcast_src_ip else None),
+        "track": [{"kind": k, "name": n, "weight": w, "where": wh}
+                  for k, n, w, wh in inst.track],
+        "auth_type": inst.auth_type,
+        "auth_pass_present": inst.auth_pass,
+        "auth_hmac_keys": list(inst.auth_hmac_keys),
+        "no_virtual_ipaddress": inst.no_virtual_ipaddress,
+    }
+
+
+def _instance_dict(model, inst):
+    return {
+        "kind": "instance",
+        "name": inst.name,
+        "where": inst.where,
+        "gate": inst.gate,
+        "context": _instance_context(inst),
+        "vips": [{"address": str(v.address), "mask": v.mask,
+                  "excluded": v.excluded, "where": v.where,
+                  "gate": v.gate, "options": dict(v.options)}
+                 for v in inst.vips],
+        "sync_groups": [{"name": sg.name, "where": sg.where}
+                        for sg in inst.sync_groups],
+    }
+
+
+def _vip_match_dict(inst, entry):
+    return {
+        "kind": "vrrp_vip",
+        "address": str(entry.address),
+        "mask": entry.mask,
+        "excluded": entry.excluded,
+        "instance": inst.name,
+        "instance_where": inst.where,
+        "where": entry.where,
+        "gate": entry.gate,
+        "options": dict(entry.options),
+    }
+
+
+def _vs_match_dict(vs):
+    return {
+        "kind": "virtual_server",
+        "form": vs.form,
+        "address": (str(vs.address) if vs.address is not None
+                    else None),
+        "port": vs.port,
+        "fwmark": vs.fwmark,
+        "group": vs.group_name,
+        "protocol": vs.protocol or "TCP",
+        "where": vs.where,
+        "gate": vs.gate,
+        "lvs_sched": vs.lvs_sched,
+        "lvs_method": vs.lvs_method,
+        "quorum": vs.quorum,
+        "real_servers": len(vs.real_servers),
+        "sorry_servers": len(vs.sorry_servers),
+    }
+
+
+def _group_member_dict(grp, member, using):
+    return {
+        "kind": "group_member",
+        "group": grp.name,
+        "group_where": grp.where,
+        "member": member.raw,
+        "member_where": member.where,
+        "port": member.port,
+        "gate": member.gate,
+        "using_servers": [{"where": vs.where,
+                           "protocol": vs.protocol or "TCP"}
+                          for vs in using],
+    }
+
+
+def _group_dict(model, grp):
+    using = [vs for vs in model.virtual_servers
+             if vs.form == "group" and
+             vs.group_name == grp.name]
+    return {
+        "kind": "virtual_server_group",
+        "name": grp.name,
+        "where": grp.where,
+        "gate": grp.gate,
+        "members": [{"member": m.raw, "where": m.where,
+                     "port": m.port, "gate": m.gate,
+                     "fwmark": m.fwmark}
+                    for m in grp.members],
+        "used_by": [{"where": vs.where,
+                     "protocol": vs.protocol or "TCP"}
+                    for vs in using],
+    }
+
+
+def _syncgroup_dict(sg):
+    return {
+        "kind": "vrrp_sync_group",
+        "name": sg.name,
+        "where": sg.where,
+        "gate": sg.gate,
+        "members": [{"name": n, "where": w}
+                    for n, w in sg.members],
+        "track": [{"kind": k, "name": n, "weight": w, "where": wh}
+                  for k, n, w, wh in sg.track],
+    }
+
+
+def _static_dict(entry):
+    return {
+        "kind": "static",
+        "address": str(entry.address),
+        "mask": entry.mask,
+        "where": entry.where,
+        "gate": entry.gate,
+    }
+
+
+def _first_blocker(blockers):
+    if not blockers:
+        return None
+    b = blockers[0]
+    return "%s (%s): %s" % (b["kind"], b["where"], b["message"])
+
+
+def _collect_vip_matches(model, ip, port=None):
+    """All declarations that could answer a VIP / VIP:PORT
+    query. Returns (vrrp, vs, groups, static) where vrrp is a
+    list of (instance, entry), vs a list of VirtualServer,
+    groups a list of (group, member, using), static a list of
+    StaticEntry."""
+    vrrp = []
+    for inst in model.instances:
+        for entry in inst.vips:
+            if entry.address == ip:
+                vrrp.append((inst, entry))
+    vs_matches = []
+    for vs in model.virtual_servers:
+        if vs.form != "ip" or vs.address is None:
+            continue
+        if vs.address != ip:
+            continue
+        if port is not None and vs.port is not None and \
+                vs.port != port:
+            continue
+        vs_matches.append(vs)
+    group_matches = []
+    for grp in model.groups:
+        for member in grp.members:
+            if member.kind == "fwmark":
+                continue
+            if not member.contains(ip):
+                continue
+            if port is not None and member.port is not None and \
+                    member.port != port:
+                continue
+            using = [vs for vs in model.virtual_servers
+                     if vs.form == "group" and
+                     vs.group_name == grp.name]
+            group_matches.append((grp, member, using))
+    static = [e for e in model.static_entries
+              if e.address == ip]
+    return vrrp, vs_matches, group_matches, static
+
+
+def _duplicate_vs_key(vs):
+    return (vs.address, vs.port, vs.protocol or "TCP")
+
+
+def query_vip(model, ip, port=None):
+    """A bare-IP query (VRRP VIPs, virtual_servers, group
+    members) or an IP:PORT query (virtual_servers and group
+    members only, KV11). Returns (verdict, decider, blocker,
+    matches, findings)."""
+    findings = []
+    vrrp, vs_matches, group_matches, static = \
+        _collect_vip_matches(model, ip, port)
+    query_label = "%s:%d" % (ip, port) if port is not None \
+        else str(ip)
+    # Scoped poison (KV21): an unparseable line inside a
+    # declaration that could hold this answer -- a VIP line, a
+    # group member line, a virtual_server header -- blocks a
+    # FOUND verdict (it could be a duplicate that changes the
+    # answer). A bad context line (e.g. a mistyped priority)
+    # cannot be a VIP and does not poison a VIP query.
+    if port is None:
+        poison_scopes = [("vip", None), ("group_member", None),
+                         ("vs_header", None)]
+    else:
+        poison_scopes = [("vs", None), ("vs_header", None),
+                         ("group_member", None)]
+    poison = _scoped_unparseable(model, poison_scopes)
+
+    def poison_unknown():
+        first = poison[0]
+        return ("UNKNOWN",
+                {"kind": "blocker", "where": first["where"],
+                 "note": "an unparseable line in the queried "
+                         "declaration prevents a static answer "
+                         "(KV21)"},
+                "%s (%s): %s" % ("unparseable", first["where"],
+                                 first["message"]),
+                [], findings)
+
+    def gated_vrrp():
+        return [(i, e) for i, e in vrrp
+                if e.gate == GATED_UNKNOWN]
+
+    def gated_vs():
+        return [vs for vs in vs_matches
+                if vs.gate == GATED_UNKNOWN]
+
+    def gated_groups():
+        return [(g, m, u) for g, m, u in group_matches
+                if m.gate == GATED_UNKNOWN]
+
+    if port is None:
+        ungated_vrrp = [(i, e) for i, e in vrrp
+                        if _is_ungated(e.gate)]
+        insts = {id(i) for i, _e in ungated_vrrp}
+        if len(insts) >= 2:
+            matches = [_vip_match_dict(i, e)
+                       for i, e in ungated_vrrp]
+            matches += [_vs_match_dict(vs)
+                        for vs in vs_matches
+                        if _is_ungated(vs.gate)]
+            matches += [_group_member_dict(g, m, u)
+                        for g, m, u in group_matches
+                        if _is_ungated(m.gate)]
+            for i, e in ungated_vrrp:
+                if e.excluded:
+                    findings.append(Finding(
+                        "KV10", "finding",
+                        "VIP %s in instance %s is in "
+                        "virtual_ipaddress_excluded "
+                        "([excluded-from-adverts]): configured on "
+                        "the node when MASTER, left out of the "
+                        "VRRP adverts" % (ip, i.name), e.where))
+            return ("AMBIGUOUS",
+                    {"kind": "ambiguous", "where": None,
+                     "note": "VIP %s is declared on %d instances "
+                             "(KV13); no first-wins" % (ip,
+                                                        len(insts))},
+                    None, matches, findings)
+        if ungated_vrrp:
+            if poison:
+                return poison_unknown()
+            matches = []
+            for i, e in ungated_vrrp:
+                matches.append(_vip_match_dict(i, e))
+                if e.excluded:
+                    findings.append(Finding(
+                        "KV10", "finding",
+                        "VIP %s in instance %s is in "
+                        "virtual_ipaddress_excluded "
+                        "([excluded-from-adverts]): configured on "
+                        "the node when MASTER, left out of the "
+                        "VRRP adverts" % (ip, i.name), e.where))
+            # A second declaration of the same VIP in the same
+            # instance is a duplicate-declaration finding on a
+            # FOUND answer (KV13), not AMBIGUOUS.
+            if len(ungated_vrrp) > 1:
+                findings.append(Finding(
+                    "KV13", "finding",
+                    "VIP %s is declared %d times in instance %s "
+                    "(%s); the instance is unambiguous, the "
+                    "repetition is not"
+                    % (ip, len(ungated_vrrp), ungated_vrrp[0][0].name,
+                       ", ".join(e.where for _i, e in
+                                 ungated_vrrp)),
+                    ungated_vrrp[0][1].where))
+            for i, e in gated_vrrp():
+                findings.append(Finding(
+                    "KV05", "finding",
+                    "gated copy of VIP %s in instance %s at %s is "
+                    "[gated-unknown] without --config-id; the "
+                    "ungated copy decides this answer"
+                    % (ip, i.name, e.where), e.where))
+            for g, m, u in gated_groups():
+                findings.append(Finding(
+                    "KV05", "finding",
+                    "gated group member %s at %s is "
+                    "[gated-unknown] without --config-id"
+                    % (m.raw, m.where), m.where))
+            # A duplicate virtual_server among the additional
+            # matches is a finding here, not AMBIGUOUS: the VRRP
+            # ownership is unambiguous (KV13).
+            _by_key = {}
+            for vs in vs_matches:
+                if _is_ungated(vs.gate):
+                    _by_key.setdefault(
+                        _duplicate_vs_key(vs), []).append(vs)
+            for _key, _vss in _by_key.items():
+                if len(_vss) > 1:
+                    findings.append(Finding(
+                        "KV13", "finding",
+                        "duplicate virtual_server %s:%s (%s) "
+                        "declared %d times (KV13)"
+                        % (_key[0], _key[1], _key[2],
+                           len(_vss)), _vss[0].where))
+            matches += [_vs_match_dict(vs) for vs in vs_matches
+                        if _is_ungated(vs.gate)]
+            matches += [_group_member_dict(g, m, u)
+                        for g, m, u in group_matches
+                        if _is_ungated(m.gate)]
+            for vs in vs_matches:
+                if vs.gate == GATED_UNKNOWN:
+                    findings.append(Finding(
+                        "KV05", "finding",
+                        "gated virtual_server for %s at %s is "
+                        "[gated-unknown] without --config-id"
+                        % (ip, vs.where), vs.where))
+            collisions = _collision_instances(model)
+            for i, _e in ungated_vrrp:
+                if id(i) in collisions:
+                    findings.append(Finding(
+                        "KV13", "finding",
+                        "instance %s shares its VRID and interface "
+                        "with another instance (KV13 warning, not "
+                        "a verdict)" % i.name, i.where))
+                    break
+            decider = ungated_vrrp[0][1]
+            return ("FOUND",
+                    {"kind": "vip", "where": decider.where,
+                     "note": "VIP %s declared in instance %s "
+                             "(%s)" % (ip, ungated_vrrp[0][0].name,
+                                       ungated_vrrp[0][0].where)},
+                    None, matches, findings)
+        # No ungated VRRP match: fall through to the VS/group
+        # branch below.
+    ungated_vs = [vs for vs in vs_matches if _is_ungated(vs.gate)]
+    ungated_grp = [(g, m, u) for g, m, u in group_matches
+                   if _is_ungated(m.gate)]
+    if ungated_vs or ungated_grp:
+        # Duplicate virtual_server IP:port is AMBIGUOUS (KV13).
+        by_key = {}
+        for vs in ungated_vs:
+            by_key.setdefault(_duplicate_vs_key(vs), []).append(vs)
+        dups = {k: v for k, v in by_key.items() if len(v) > 1}
+        if dups:
+            matches = []
+            for vs_list in dups.values():
+                matches += [_vs_match_dict(vs)
+                            for vs in vs_list]
+            key = next(iter(dups))
+            return ("AMBIGUOUS",
+                    {"kind": "ambiguous", "where": None,
+                     "note": "duplicate virtual_server %s:%s "
+                             "(%s) declared %d times (KV13)"
+                             % (key[0], key[1], key[2],
+                                len(dups[key]))},
+                    None, matches, findings)
+        if poison:
+            return poison_unknown()
+        matches = [_vs_match_dict(vs) for vs in ungated_vs]
+        matches += [_group_member_dict(g, m, u)
+                    for g, m, u in ungated_grp]
+        for vs in ungated_vs:
+            if port is not None and vs.port is None:
+                findings.append(Finding(
+                    "KV11", "finding",
+                    "virtual_server at %s declares no port (the "
+                    "persistent-service form); it matches the "
+                    "port-qualified query on address equality "
+                    "alone [docs-inferred]" % vs.where, vs.where))
+        for g, m, u in gated_groups():
+            findings.append(Finding(
+                "KV05", "finding",
+                "gated group member %s at %s is [gated-unknown] "
+                "without --config-id" % (m.raw, m.where), m.where))
+        for i, e in gated_vrrp():
+            findings.append(Finding(
+                "KV05", "finding",
+                "gated copy of VIP %s in instance %s at %s is "
+                "[gated-unknown] without --config-id"
+                % (ip, i.name, e.where), e.where))
+        decider = matches[0]
+        decider_where = decider.get("where") or \
+            decider.get("member_where")
+        return ("FOUND",
+                {"kind": decider["kind"],
+                 "where": decider_where,
+                 "note": "%s declared at %s"
+                         % (query_label, decider_where)},
+                None, matches, findings)
+    # Gated-unknown matches (KV05/KV17).
+    gated = gated_vrrp() + gated_vs() + gated_groups()
+    gated_cands = _gated_candidates_for(
+        model, ("vip", "vs", "group_member"))
+    if gated or gated_cands:
+        if gated:
+            first = gated[0]
+            where = first[1].where if isinstance(first, tuple) \
+                else first.where
+        else:
+            where = gated_cands[0]["where"]
+        return ("GATED-UNKNOWN",
+                {"kind": "gated", "where": where,
+                 "note": "the only matching declaration(s) for %s "
+                         "are [gated-unknown] without --config-id "
+                         "(KV05)" % query_label},
+                "gated-unknown declaration at %s (KV05); re-run "
+                "with --config-id to resolve it" % where,
+                [], findings)
+    # UNKNOWN blockers (KV04/KV06/KV07/KV21). A ~SEQ line that
+    # generates vrrp_instance headers could generate VIPs too
+    # (the generated block's body is generated with it, KV07),
+    # so the VIP kinds include "instance", "vs" and "group".
+    # Scoped unparseable lines are included here too, for the
+    # no-ungated-match case (they were already checked above
+    # before any FOUND verdict).
+    blockers = model.global_blockers() + \
+        model.seq_blockers_for(
+            {"instance", "vs", "group", "vip", "group_member"})
+    for u in poison:
+        blockers.append({"kind": "unparseable", "where": u["where"],
+                         "message": u["message"]})
+    if blockers:
+        return ("UNKNOWN",
+                {"kind": "blocker", "where": blockers[0]["where"],
+                 "note": "a blocker prevents a static answer "
+                         "(KV18)"},
+                _first_blocker(blockers), [], findings)
+    # Static addresses are NOT VIPs (KV16).
+    ungated_static = [e for e in static if _is_ungated(e.gate)]
+    if ungated_static and port is None:
+        entry = ungated_static[0]
+        return ("NOT-A-VIP",
+                {"kind": "static", "where": entry.where,
+                 "note": "%s is statically configured "
+                         "(static_ipaddress at %s), not "
+                         "VRRP-managed; no instance owns it (KV16)"
+                         % (ip, entry.where)},
+                None, [_static_dict(entry)], findings)
+    gated_static = [e for e in static
+                    if e.gate == GATED_UNKNOWN]
+    if gated_static and port is None:
+        return ("GATED-UNKNOWN",
+                {"kind": "gated", "where": gated_static[0].where,
+                 "note": "the only matching declaration for %s is "
+                         "a [gated-unknown] static_ipaddress entry "
+                         "(KV05/KV16)" % ip},
+                "gated-unknown static entry at %s (KV05); re-run "
+                "with --config-id to resolve it"
+                % gated_static[0].where,
+                [], findings)
+    if port is not None:
+        if vrrp:
+            findings.append(Finding(
+                "KV11", "finding",
+                "VRRP VIP %s exists (instance %s) but an IP:PORT "
+                "query matches virtual_servers only (KV11)"
+                % (ip, vrrp[0][0].name), vrrp[0][1].where))
+        if ungated_static:
+            findings.append(Finding(
+                "KV16", "finding",
+                "%s is statically configured (static_ipaddress "
+                "at %s), not a virtual_server (KV16)"
+                % (ip, ungated_static[0].where),
+                ungated_static[0].where))
+    return ("NOT-FOUND",
+            {"kind": "not_found", "where": None,
+             "note": "no declaration of %s in the loaded tree"
+                     % query_label},
+            None, [], findings)
+
+
+def query_name(model, name):
+    """An instance / virtual_server_group / vrrp_sync_group name
+    query. A name matching both an instance and a group is
+    answered for both, labeled by kind (KV18)."""
+    findings = []
+    insts = model.instances_by_name.get(name, [])
+    groups = model.groups_by_name.get(name, [])
+    syncs = [sg for sg in model.sync_groups
+             if sg.name == name]
+    ungated_insts = [i for i in insts if _is_ungated(i.gate)]
+    ungated_groups = [g for g in groups if _is_ungated(g.gate)]
+    ungated_syncs = [s for s in syncs if _is_ungated(s.gate)]
+    if len(ungated_insts) > 1:
+        matches = [_instance_dict(model, i)
+                   for i in ungated_insts]
+        return ("AMBIGUOUS",
+                {"kind": "ambiguous", "where": None,
+                 "note": "instance name %r is defined %d times "
+                         "(KV13); no first-wins"
+                         % (name, len(ungated_insts))},
+                None, matches, findings)
+    if len(ungated_groups) > 1:
+        matches = [_group_dict(model, g)
+                   for g in ungated_groups]
+        return ("AMBIGUOUS",
+                {"kind": "ambiguous", "where": None,
+                 "note": "virtual_server_group name %r is defined "
+                         "%d times (KV13); no first-wins"
+                         % (name, len(ungated_groups))},
+                None, matches, findings)
+    if ungated_insts or ungated_groups or ungated_syncs:
+        # Scoped poison (KV21): an unparseable line inside the
+        # matched declaration blocks a FOUND verdict -- it could
+        # be a declaration v1 cannot read.
+        poison = []
+        if ungated_insts:
+            poison += _scoped_unparseable(
+                model, [("instance", name),
+                        ("instance_header", None)])
+        if ungated_groups:
+            poison += _scoped_unparseable(
+                model, [("group_member", name),
+                        ("group_header", None)])
+        if ungated_syncs:
+            poison += _scoped_unparseable(
+                model, [("syncgroup", name)])
+        if poison:
+            first = poison[0]
+            return ("UNKNOWN",
+                    {"kind": "blocker", "where": first["where"],
+                     "note": "an unparseable line in the queried "
+                             "declaration prevents a static answer "
+                             "(KV21)"},
+                    "%s (%s): %s" % ("unparseable", first["where"],
+                                     first["message"]),
+                    [], findings)
+        matches = []
+        if ungated_insts:
+            inst = ungated_insts[0]
+            matches.append(_instance_dict(model, inst))
+            if id(inst) in _collision_instances(model):
+                findings.append(Finding(
+                    "KV13", "finding",
+                    "instance %s shares its VRID and interface "
+                    "with another instance (KV13 warning, not a "
+                    "verdict)" % name, inst.where))
+            for i in insts:
+                if i.gate == GATED_UNKNOWN:
+                    findings.append(Finding(
+                        "KV05", "finding",
+                        "gated copy of instance %s at %s is "
+                        "[gated-unknown] without --config-id; the "
+                        "ungated copy decides this answer"
+                        % (name, i.where), i.where))
+        for grp in ungated_groups:
+            matches.append(_group_dict(model, grp))
+            for g in groups:
+                if g.gate == GATED_UNKNOWN:
+                    findings.append(Finding(
+                        "KV05", "finding",
+                        "gated copy of group %s at %s is "
+                        "[gated-unknown] without --config-id"
+                        % (name, g.where), g.where))
+        for sg in ungated_syncs:
+            matches.append(_syncgroup_dict(sg))
+        decider = matches[0]
+        return ("FOUND",
+                {"kind": "instance" if ungated_insts else
+                 "virtual_server_group",
+                 "where": decider["where"],
+                 "note": "%s declared at %s"
+                         % (name, decider["where"])},
+                None, matches, findings)
+    gated = [i for i in insts if i.gate == GATED_UNKNOWN] + \
+            [g for g in groups if g.gate == GATED_UNKNOWN] + \
+            [s for s in syncs if s.gate == GATED_UNKNOWN]
+    gated_cands = _gated_candidates_for(
+        model, ("instance", "group", "syncgroup"), name)
+    if gated or gated_cands:
+        where = (gated[0].where if gated
+                 else gated_cands[0]["where"])
+        return ("GATED-UNKNOWN",
+                {"kind": "gated", "where": where,
+                 "note": "the only declaration(s) named %r are "
+                         "[gated-unknown] without --config-id "
+                         "(KV05)" % name},
+                "gated-unknown declaration at %s (KV05); re-run "
+                "with --config-id to resolve it" % where,
+                [], findings)
+    blockers = model.global_blockers() + \
+        model.seq_blockers_for({"instance", "group", "syncgroup"})
+    for u in _scoped_unparseable(
+            model, [("instance", name), ("instance_header", None),
+                    ("group_member", name), ("group_header", None)]):
+        blockers.append({"kind": "unparseable", "where": u["where"],
+                         "message": u["message"]})
+    if blockers:
+        return ("UNKNOWN",
+                {"kind": "blocker", "where": blockers[0]["where"],
+                 "note": "a blocker prevents a static answer "
+                         "(KV18)"},
+                _first_blocker(blockers), [], findings)
+    return ("NOT-FOUND",
+            {"kind": "not_found", "where": None,
+             "note": "no instance or group named %r in the loaded "
+                     "tree" % name},
+            None, [], findings)
+
+
+def query_fwmark(model, mark):
+    """A `fwmark N` query: fwmark virtual_servers, plus groups
+    containing a fwmark N member (KV11/KV12)."""
+    findings = []
+    vs_matches = [vs for vs in model.virtual_servers
+                  if vs.form == "fwmark" and vs.fwmark == mark]
+    group_matches = []
+    for grp in model.groups:
+        for member in grp.members:
+            if member.kind == "fwmark" and \
+                    member.fwmark == mark:
+                using = [vs for vs in model.virtual_servers
+                         if vs.form == "group" and
+                         vs.group_name == grp.name]
+                group_matches.append((grp, member, using))
+    ungated_vs = [vs for vs in vs_matches
+                  if _is_ungated(vs.gate)]
+    ungated_grp = [(g, m, u) for g, m, u in group_matches
+                   if _is_ungated(m.gate)]
+    if ungated_vs or ungated_grp:
+        # Scoped poison (KV21) blocks a FOUND verdict.
+        poison = _scoped_unparseable(
+            model, [("vs", None), ("vs_header", None),
+                    ("group_member", None)])
+        if poison:
+            first = poison[0]
+            return ("UNKNOWN",
+                    {"kind": "blocker", "where": first["where"],
+                     "note": "an unparseable line in the queried "
+                             "declaration prevents a static answer "
+                             "(KV21)"},
+                    "%s (%s): %s" % ("unparseable", first["where"],
+                                     first["message"]),
+                    [], findings)
+        matches = [_vs_match_dict(vs) for vs in ungated_vs]
+        matches += [_group_member_dict(g, m, u)
+                    for g, m, u in ungated_grp]
+        if len(ungated_vs) > 1:
+            findings.append(Finding(
+                "KV11", "finding",
+                "fwmark %d is declared by %d virtual_servers "
+                "(%s); the daemon's behavior on duplicate fwmark "
+                "servers is unverified, so both are listed"
+                % (mark, len(ungated_vs),
+                   ", ".join(vs.where for vs in ungated_vs)),
+                ungated_vs[0].where))
+        decider = matches[0]
+        return ("FOUND",
+                {"kind": "fwmark", "where": decider["where"],
+                 "note": "fwmark %d declared at %s"
+                         % (mark, decider["where"])},
+                None, matches, findings)
+    gated = [vs for vs in vs_matches
+             if vs.gate == GATED_UNKNOWN] + \
+            [m for _g, m, _u in group_matches
+             if m.gate == GATED_UNKNOWN]
+    gated_cands = _gated_candidates_for(model, ("vs",))
+    if gated or gated_cands:
+        where = (gated[0].where if gated
+                 else gated_cands[0]["where"])
+        return ("GATED-UNKNOWN",
+                {"kind": "gated", "where": where,
+                 "note": "the only fwmark %d declaration(s) are "
+                         "[gated-unknown] without --config-id "
+                         "(KV05)" % mark},
+                "gated-unknown declaration at %s (KV05); re-run "
+                "with --config-id to resolve it" % where,
+                [], findings)
+    blockers = model.global_blockers() + \
+        model.seq_blockers_for({"vs", "group", "group_member"})
+    for u in _scoped_unparseable(
+            model, [("vs", None), ("vs_header", None),
+                    ("group_member", None)]):
+        blockers.append({"kind": "unparseable", "where": u["where"],
+                         "message": u["message"]})
+    if blockers:
+        return ("UNKNOWN",
+                {"kind": "blocker", "where": blockers[0]["where"],
+                 "note": "a blocker prevents a static answer "
+                         "(KV18)"},
+                _first_blocker(blockers), [], findings)
+    return ("NOT-FOUND",
+            {"kind": "not_found", "where": None,
+             "note": "no virtual_server or group with fwmark %d "
+                     "in the loaded tree" % mark},
+            None, [], findings)
+
+# --------------------------------------------------------------- reporting
+
+def coverage_dict(model):
+    total_vips = sum(len(i.vips) for i in model.instances)
+    excluded = sum(1 for i in model.instances for v in i.vips
+                   if v.excluded)
+    by_instance = {}
+    for inst in model.instances:
+        key = inst.name if inst.name is not None \
+            else "(unnamed instance at %s)" % inst.where
+        by_instance[key] = len(inst.vips)
+    scripts_by_class = {}
+    for s in model.script_inventory:
+        scripts_by_class[s["class"]] = \
+            scripts_by_class.get(s["class"], 0) + 1
+    return {
+        "files": [{"path": f["path"], "bytes": f["bytes"],
+                   "lines": f["lines"],
+                   "included_from": f["included_from"]}
+                  for f in model.loader.files],
+        "expansions": [{"where": e["where"],
+                        "variant": e["variant"],
+                        "pattern": e["pattern"],
+                        "level": e["level"],
+                        "matches": e["matches"]}
+                       for e in model.loader.expansions],
+        "instances": [{"name": i.name, "where": i.where,
+                       "gate": i.gate, "vips": len(i.vips)}
+                      for i in model.instances],
+        "vips": {"total": total_vips, "excluded": excluded,
+                 "by_instance": by_instance},
+        "virtual_servers": len(model.virtual_servers),
+        "groups": len(model.groups),
+        "sync_groups": len(model.sync_groups),
+        "gated_lines": {"count": len(model.gated_lines),
+                        "lines": [g["where"]
+                                  for g in model.gated_lines]},
+        "seq_lines": [{"where": s["where"], "gate": s["gate"],
+                       "kind": s.get("kind")}
+                      for s in model.seq_lines],
+        "random_lines": [{"where": r["where"], "gate": r["gate"]}
+                         for r in model.random_lines],
+        "scripts": {"total": len(model.script_inventory),
+                    "by_class": scripts_by_class},
+        "static_addresses": len(model.static_entries),
+        "static_routes": model.static_routes,
+        "static_rules": model.static_rules,
+        "virtual_routes": model.virtual_routes,
+        "virtual_rules": model.virtual_rules,
+        "unparseable_count": len(model.unparseable),
+        "skipped_lines": model.skipped_lines,
+    }
+
+
+def banners_for(model, query_kind):
+    banners = []
+    if model.config_id is None:
+        banners.append(
+            "[config-id-not-given] no --config-id was given, so "
+            "@-gated lines are [gated-unknown], never silently "
+            "included or dropped (KV05). The tool deliberately "
+            "does not default to the local hostname (the daemon's "
+            "default): it is usually run off-node, where the local "
+            "hostname is the wrong node.")
+    banners.append(
+        "[on-disk-policy] every verdict describes the files on "
+        "disk, not the running daemon; a reload can change the "
+        "effective config (KV01).")
+    if query_kind in ("instance", "vip", "vip_port"):
+        banners.append(
+            "[mastership-not-adjudicated] this answer names the "
+            "declaring instance(s) and their configured state / "
+            "priority / nopreempt, never who is MASTER now: "
+            "mastership needs the peer's file, the peer's runtime "
+            "state, and the adverts actually seen (KV01/KV22).")
+    return banners
+
+
+def unmodeled_list(model):
+    out = []
+    for s in model.script_inventory:
+        out.append({
+            "reason": "script %s (%s) is inventoried, never "
+                      "executed (KV15)" % (s["path"], s["class"]),
+            "where": s["where"]})
+    for s in model.seq_lines:
+        out.append({
+            "reason": "~SEQ/~LST line is not expanded "
+                      "([seq-unknown], KV07)",
+            "where": s["where"]})
+    for r in model.random_lines:
+        out.append({
+            "reason": "line contains ${_RANDOM} "
+                      "([random-unknown], KV06)",
+            "where": r["where"]})
+    for e in model.static_entries:
+        out.append({
+            "reason": "static address %s is NOT a VIP (KV16)"
+                      % e.address,
+            "where": e.where})
+    return out
+
+
+def build_report(model, query, verdict, decider, blocker,
+                 matches, findings):
+    all_findings = _dedup_findings(model.findings + findings)
+    return {
+        "tool": "keepalivedwho",
+        "version": VERSION,
+        "mode": "query",
+        "config_id": model.config_id,
+        "query": query,
+        "verdict": verdict,
+        "decider": decider,
+        "blocker": blocker,
+        "matches": matches,
+        "findings": [f.as_json() for f in all_findings],
+        "unmodeled": unmodeled_list(model),
+        "coverage": coverage_dict(model),
+        "banners": banners_for(model, query["kind"]),
+    }
+
+
+def _render_match(m):
+    kind = m["kind"]
+    if kind == "vrrp_vip":
+        addr = m["address"]
+        if m["mask"] is not None:
+            addr += "/%d" % m["mask"]
+        opts = ""
+        if m["options"]:
+            opts = " " + " ".join(
+                ("%s=%s" % (k, v) if v is not True else k)
+                for k, v in sorted(m["options"].items()))
+        excl = " [excluded-from-adverts]" if m["excluded"] else ""
+        gate = " [%s]" % m["gate"] if m["gate"] != UNGATED else ""
+        return ("  vrrp VIP %s (instance %s at %s) at %s%s%s%s"
+                % (addr, m["instance"], m["instance_where"],
+                   m["where"], opts, excl, gate))
+    if kind == "virtual_server":
+        if m["form"] == "ip":
+            addr = m["address"] or "?"
+            if m["port"] is not None:
+                addr += ":%d" % m["port"]
+            else:
+                addr += " (no port -- persistent service)"
+        elif m["form"] == "fwmark":
+            addr = "fwmark %s" % m["fwmark"]
+        else:
+            addr = "group %s" % m["group"]
+        gate = " [%s]" % m["gate"] if m["gate"] != UNGATED else ""
+        return ("  virtual_server %s (%s, %s, %d real server(s)) "
+                "at %s%s"
+                % (addr, m["protocol"], m["lvs_sched"] or "-",
+                   m["real_servers"], m["where"], gate))
+    if kind == "group_member":
+        using = ""
+        if m["using_servers"]:
+            using = "; used by virtual_server group at %s" % \
+                ", ".join(u["where"] for u in m["using_servers"])
+        gate = " [%s]" % m["gate"] if m["gate"] != UNGATED else ""
+        port = ":%d" % m["port"] if m["port"] is not None else ""
+        return ("  group member %s%s (group %s at %s) at %s%s%s"
+                % (m["member"], port, m["group"],
+                   m["group_where"], m["member_where"], using,
+                   gate))
+    if kind == "instance":
+        c = m["context"]
+        lines = ["  instance %s at %s%s"
+                 % (m["name"], m["where"],
+                    (" [%s]" % m["gate"])
+                    if m["gate"] != UNGATED else "")]
+        ctx_bits = []
+        if c["state"] is not None:
+            ctx_bits.append("state %s" % c["state"])
+        if c["interface"] is not None:
+            ctx_bits.append("interface %s" % c["interface"])
+        if c["virtual_router_id"] is not None:
+            ctx_bits.append("VRID %d" % c["virtual_router_id"])
+        if c["priority"] is not None:
+            ctx_bits.append("priority %d" % c["priority"])
+        if c["advert_int"] is not None:
+            ctx_bits.append("advert_int %s" % c["advert_int"])
+        if c["nopreempt"]:
+            ctx_bits.append("nopreempt")
+        if c["preempt_delay"] is not None:
+            ctx_bits.append("preempt_delay %d"
+                            % c["preempt_delay"])
+        if c["accept"] is not None:
+            ctx_bits.append("accept" if c["accept"]
+                            else "no_accept")
+        if c["version"] is not None:
+            ctx_bits.append("version %d" % c["version"])
+        if c["use_vmac"]:
+            ctx_bits.append("use_vmac")
+        if c["unicast_src_ip"] is not None:
+            ctx_bits.append("unicast_src_ip %s"
+                            % c["unicast_src_ip"])
+        if c["unicast_peers"]:
+            ctx_bits.append("unicast_peer %s"
+                            % ", ".join(c["unicast_peers"]))
+        if c["mcast_src_ip"] is not None:
+            ctx_bits.append("mcast_src_ip %s"
+                            % c["mcast_src_ip"])
+        if c["track"]:
+            ctx_bits.append("track %s" % ", ".join(
+                "%s %s%s" % (t["kind"], t["name"],
+                             (" weight %d" % t["weight"])
+                             if t["weight"] is not None else "")
+                for t in c["track"]))
+        if c["auth_type"] is not None:
+            ctx_bits.append("auth_type %s" % c["auth_type"])
+        if c["auth_pass_present"]:
+            ctx_bits.append("auth_pass <present>")
+        if c["auth_hmac_keys"]:
+            ctx_bits.append("auth_hmac keys %s"
+                            % ", ".join(c["auth_hmac_keys"]))
+        if c["no_virtual_ipaddress"]:
+            ctx_bits.append("no_virtual_ipaddress")
+        if ctx_bits:
+            lines.append("    context: %s" % "; ".join(ctx_bits))
+        if m["vips"]:
+            lines.append("    VIPs:")
+            for v in m["vips"]:
+                addr = v["address"]
+                if v["mask"] is not None:
+                    addr += "/%d" % v["mask"]
+                excl = " [excluded-from-adverts]" \
+                    if v["excluded"] else ""
+                gate = " [%s]" % v["gate"] \
+                    if v["gate"] != UNGATED else ""
+                lines.append("      %s at %s%s%s"
+                             % (addr, v["where"], excl, gate))
+        else:
+            lines.append("    VIPs: none")
+        if m["sync_groups"]:
+            lines.append("    sync groups: %s" % ", ".join(
+                "%s (%s)" % (sg["name"], sg["where"])
+                for sg in m["sync_groups"]))
+        return "\n".join(lines)
+    if kind == "virtual_server_group":
+        lines = ["  virtual_server_group %s at %s%s"
+                 % (m["name"], m["where"],
+                    (" [%s]" % m["gate"])
+                    if m["gate"] != UNGATED else "")]
+        for mem in m["members"]:
+            port = ":%d" % mem["port"] \
+                if mem["port"] is not None else ""
+            gate = " [%s]" % mem["gate"] \
+                if mem["gate"] != UNGATED else ""
+            lines.append("    member %s%s at %s%s"
+                         % (mem["member"], port, mem["where"],
+                            gate))
+        if m["used_by"]:
+            lines.append("    used by virtual_server group at %s"
+                         % ", ".join(u["where"]
+                                     for u in m["used_by"]))
+        return "\n".join(lines)
+    if kind == "vrrp_sync_group":
+        lines = ["  vrrp_sync_group %s at %s%s"
+                 % (m["name"], m["where"],
+                    (" [%s]" % m["gate"])
+                    if m["gate"] != UNGATED else "")]
+        lines.append("    members: %s" % ", ".join(
+            "%s (%s)" % (x["name"], x["where"])
+            for x in m["members"]))
+        return "\n".join(lines)
+    if kind == "static":
+        addr = m["address"]
+        if m["mask"] is not None:
+            addr += "/%d" % m["mask"]
+        gate = " [%s]" % m["gate"] if m["gate"] != UNGATED else ""
+        return "  static %s at %s%s" % (addr, m["where"], gate)
+    return "  %s" % (m,)
+
+
+def render_text(report):
+    lines = [report["verdict"]]
+    decider = report["decider"]
+    if decider:
+        where = " (%s)" % decider["where"] \
+            if decider.get("where") else ""
+        lines.append("decider: %s%s -- %s"
+                     % (decider["kind"], where, decider["note"]))
+    if report.get("blocker"):
+        lines.append("blocker: %s" % report["blocker"])
+    if report["query"].get("mask") is not None:
+        lines.append("query mask: /%d (ignored for matching, shown "
+                     "for comparison, KV10)"
+                     % report["query"]["mask"])
+    if report["matches"]:
+        lines.append("matches:")
+        for m in report["matches"]:
+            lines.append(_render_match(m))
+    if report["findings"]:
+        lines.append("")
+        lines.append("findings:")
+        for f in report["findings"]:
+            loc = " (%s)" % f["where"] if f.get("where") else ""
+            lines.append("  [%s] %s: %s%s"
+                         % (f["id"], f["severity"], f["message"],
+                            loc))
+    if report["unmodeled"]:
+        lines.append("")
+        lines.append("unmodeled (bannered, never approximated):")
+        for u in report["unmodeled"]:
+            loc = " (%s)" % u["where"] if u.get("where") else ""
+            lines.append("  - %s%s" % (u["reason"], loc))
+    cov = report["coverage"]
+    lines.append("")
+    lines.append("coverage: %d file(s), %d instance(s), %d VIP(s) "
+                 "(%d excluded), %d virtual_server(s), %d "
+                 "group(s); gated lines: %d; ~SEQ/~LST lines: %d; "
+                 "${_RANDOM} lines: %d; scripts: %d; static "
+                 "addresses: %d; unparseable lines: %d; skipped "
+                 "lines: %d"
+                 % (len(cov["files"]), len(cov["instances"]),
+                    cov["vips"]["total"], cov["vips"]["excluded"],
+                    cov["virtual_servers"], cov["groups"],
+                    cov["gated_lines"]["count"],
+                    len(cov["seq_lines"]), len(cov["random_lines"]),
+                    cov["scripts"]["total"],
+                    cov["static_addresses"],
+                    cov["unparseable_count"],
+                    cov["skipped_lines"]))
+    for f in cov["files"]:
+        inc = " (included from %s)" % f["included_from"] \
+            if f.get("included_from") else ""
+        lines.append("  file: %s (%d bytes, %d lines)%s"
+                     % (f["path"], f["bytes"], f["lines"], inc))
+    for e in cov["expansions"]:
+        lines.append("  include: %s %r at %s (level: %s; matches: "
+                     "%d, sorted)"
+                     % (e["variant"], e["pattern"], e["where"],
+                        ", ".join(e["level"]) or "none",
+                        len(e["matches"])))
+    if cov["gated_lines"]["lines"] and \
+            report.get("config_id") is None:
+        lines.append("  gated lines: %s"
+                     % ", ".join(cov["gated_lines"]["lines"]))
+    for b in report["banners"]:
+        lines.append("banner: %s" % b)
+    return "\n".join(lines) + "\n"
+
+
+# -------------------------------------------------------------- inventory
+
+def render_inventory(model, list_instances, list_vips,
+                     list_servers, as_json):
+    findings = _dedup_findings(model.findings)
+    data = {
+        "tool": "keepalivedwho",
+        "version": VERSION,
+        "mode": "inventory",
+        "instances": [],
+        "vips": [],
+        "servers": [],
+        "findings": [f.as_json() for f in findings],
+        "unmodeled": unmodeled_list(model),
+        "coverage": coverage_dict(model),
+        "banners": banners_for(model, "inventory"),
+    }
+    if list_instances:
+        for inst in model.instances:
+            data["instances"].append(_instance_dict(model, inst))
+        for sg in model.sync_groups:
+            data["instances"].append(_syncgroup_dict(sg))
+    if list_vips:
+        for inst in model.instances:
+            for v in inst.vips:
+                data["vips"].append(_vip_match_dict(inst, v))
+    if list_servers:
+        for vs in model.virtual_servers:
+            data["servers"].append(_vs_match_dict(vs))
+        for grp in model.groups:
+            data["servers"].append(_group_dict(model, grp))
+    count = len(data["instances"]) + len(data["vips"]) + \
+        len(data["servers"])
+    if as_json:
+        return json.dumps(data, indent=2) + "\n", count
+    lines = []
+    if list_instances:
+        lines.append("vrrp_instances:")
+        for m in data["instances"]:
+            lines.append(_render_match(m))
+    if list_vips:
+        lines.append("VIPs:")
+        for m in data["vips"]:
+            lines.append(_render_match(m))
+    if list_servers:
+        lines.append("virtual_servers and groups:")
+        for m in data["servers"]:
+            lines.append(_render_match(m))
+    if findings:
+        lines.append("")
+        lines.append("findings:")
+        for f in data["findings"]:
+            loc = " (%s)" % f["where"] if f.get("where") else ""
+            lines.append("  [%s] %s: %s%s"
+                         % (f["id"], f["severity"], f["message"],
+                            loc))
+    return "\n".join(lines) + "\n", count
+
+
+# ------------------------------------------------------------------- main
+
+def _classify_query(token):
+    """Classify one positional query token. Returns a query dict,
+    or raises UsageError for a malformed query (exit 2)."""
+    text = token
+    mask = None
+    # Bracketed IPv6, optionally with a port: [2001:db8::1]:443.
+    if text.startswith("["):
+        m = re.match(r"^\[([^\]]+)\](?::(\d+))?$", text)
+        if m is None:
+            raise UsageError(
+                "malformed query %r: expected [IPv6] or "
+                "[IPv6]:PORT" % text)
+        try:
+            ip = ipaddress.ip_address(m.group(1))
+        except ValueError:
+            raise UsageError(
+                "malformed query %r: %r is not a valid IP address"
+                % (text, m.group(1)))
+        if m.group(2) is not None:
+            port = int(m.group(2))
+            if not 0 <= port <= 65535:
+                raise UsageError(
+                    "malformed query %r: port %d out of range "
+                    "0-65535" % (text, port))
+            return {"kind": "vip_port", "text": text,
+                    "address": str(ip), "port": port, "mask": None,
+                    "name": None, "fwmark": None}
+        return {"kind": "vip", "text": text, "address": str(ip),
+                "port": None, "mask": None, "name": None,
+                "fwmark": None}
+    # A mask: IP[/MASK] (KV10: ignored for matching, shown for
+    # comparison).
+    if "/" in text:
+        left, _, mask_s = text.partition("/")
+        if not mask_s.isdigit():
+            raise UsageError(
+                "malformed query %r: mask %r is not numeric"
+                % (text, mask_s))
+        try:
+            ip = ipaddress.ip_address(left)
+        except ValueError:
+            raise UsageError(
+                "malformed query %r: %r is not a valid IP address"
+                % (text, left))
+        mask = int(mask_s)
+        if not 0 <= mask <= (32 if ip.version == 4 else 128):
+            raise UsageError(
+                "malformed query %r: mask /%d out of range"
+                % (text, mask))
+        return {"kind": "vip", "text": text, "address": str(ip),
+                "port": None, "mask": mask, "name": None,
+                "fwmark": None}
+    # A bare IP address.
+    try:
+        ip = ipaddress.ip_address(text)
+        return {"kind": "vip", "text": text, "address": str(ip),
+                "port": None, "mask": None, "name": None,
+                "fwmark": None}
+    except ValueError:
+        pass
+    # IP:PORT (one colon; a bare IPv6 address was handled above).
+    if ":" in text:
+        left, _, port_s = text.rpartition(":")
+        if not port_s.isdigit():
+            raise UsageError(
+                "malformed query %r: %r is not a port number"
+                % (text, port_s))
+        try:
+            ip = ipaddress.ip_address(left)
+        except ValueError:
+            raise UsageError(
+                "malformed query %r: %r is not a valid IP address"
+                % (text, left))
+        port = int(port_s)
+        if not 0 <= port <= 65535:
+            raise UsageError(
+                "malformed query %r: port %d out of range 0-65535"
+                % (text, port))
+        return {"kind": "vip_port", "text": text,
+                "address": str(ip), "port": port, "mask": None,
+                "name": None, "fwmark": None}
+    # An instance / group name.
+    if not re.match(r"^[A-Za-z0-9_.\-]+$", text):
+        raise UsageError(
+            "malformed query %r: not an IP, IP:PORT, or instance / "
+            "group name" % text)
+    return {"kind": "instance", "text": text, "address": None,
+            "port": None, "mask": None, "name": text,
+            "fwmark": None}
+
+
+def load_model(conf_paths, config_id):
+    loader = Loader(config_id)
+    try:
+        loader.load(conf_paths)
+    except FatalConfig:
+        raise
+    except _ReadError as exc:
+        raise FatalConfig(exc.message, where=exc.where)
+    model = Model(loader, config_id)
+    parser = Parser(model, config_id)
+    parser.parse(loader.lines)
+    model.finalize()
+    return model
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="keepalivedwho",
+        description="Which include file:line declared this "
+        "vrrp_instance / virtual_server / VIP, and is it gated "
+        "by a config-id conditional (static model of "
+        "keepalived's documented configuration rules).")
+    ap.add_argument("query", nargs="*",
+                    help="VIP, VIP:PORT, instance/group name, or "
+                    "'fwmark N'")
+    ap.add_argument("--config-id",
+                    help="config-id to resolve @ conditionals "
+                    "against (KV05); without it, @-gated lines "
+                    "are [gated-unknown]")
+    ap.add_argument("--conf", action="append", default=[],
+                    help="config file (repeatable; default "
+                    "/etc/keepalived/keepalived.conf)")
+    ap.add_argument("--list-instances", action="store_true",
+                    help="list every vrrp_instance and "
+                    "vrrp_sync_group in load order")
+    ap.add_argument("--list-vips", action="store_true",
+                    help="list every VIP in load order")
+    ap.add_argument("--list-servers", action="store_true",
+                    help="list every virtual_server and "
+                    "virtual_server_group in load order")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable output")
+    ap.add_argument("--quiet", action="store_true",
+                    help="print the verdict line only")
+    ap.add_argument("--version", action="store_true",
+                    help="print the version and exit")
+    args = ap.parse_args(argv)
+    if args.version:
+        print("keepalivedwho %s" % VERSION)
+        return 0
+    conf_paths = list(args.conf)
+    if not conf_paths:
+        if os.path.exists(DEFAULT_CONF):
+            conf_paths = [DEFAULT_CONF]
+        else:
+            print("keepalivedwho: no --conf given and default "
+                  "config %s does not exist" % DEFAULT_CONF,
+                  file=sys.stderr)
+            return 2
+    try:
+        model = load_model(conf_paths, args.config_id)
+    except FatalConfig as exc:
+        loc = " (%s)" % exc.where if exc.where else ""
+        print("keepalivedwho: %s%s" % (exc.message, loc),
+              file=sys.stderr)
+        return 2
+    if len(conf_paths) > 1:
+        model.findings.append(Finding(
+            "KV02", "info",
+            "multiple --conf files concatenated in the given "
+            "order (a keepalivedwho convenience -- keepalived "
+            "itself takes one -f file)"))
+    if args.list_instances or args.list_vips or args.list_servers:
+        out, count = render_inventory(
+            model, args.list_instances, args.list_vips,
+            args.list_servers, args.json)
+        sys.stdout.write(out)
+        return 0 if count >= 1 else 1
+    if not args.query:
+        print("keepalivedwho: a query is required (VIP, VIP:PORT, "
+              "instance/group name, or 'fwmark N')",
+              file=sys.stderr)
+        return 2
+    try:
+        if len(args.query) == 2 and args.query[0] == "fwmark":
+            if not args.query[1].isdigit():
+                raise UsageError(
+                    "malformed query 'fwmark %s': the mark must be "
+                    "an integer" % args.query[1])
+            query = {"kind": "fwmark", "text": "fwmark %s"
+                     % args.query[1], "address": None,
+                     "port": None, "mask": None, "name": None,
+                     "fwmark": int(args.query[1])}
+        elif len(args.query) == 1:
+            query = _classify_query(args.query[0])
+        else:
+            raise UsageError(
+                "malformed query %r: one positional (VIP, VIP:PORT, "
+                "instance/group name) or 'fwmark N'"
+                % " ".join(args.query))
+    except UsageError as exc:
+        print("keepalivedwho: %s" % exc.message, file=sys.stderr)
+        return 2
+    if query["kind"] == "vip":
+        verdict, decider, blocker, matches, findings = query_vip(
+            model, ipaddress.ip_address(query["address"]))
+    elif query["kind"] == "vip_port":
+        verdict, decider, blocker, matches, findings = query_vip(
+            model, ipaddress.ip_address(query["address"]),
+            port=query["port"])
+    elif query["kind"] == "fwmark":
+        verdict, decider, blocker, matches, findings = \
+            query_fwmark(model, query["fwmark"])
+    else:
+        verdict, decider, blocker, matches, findings = \
+            query_name(model, query["name"])
+    report = build_report(model, query, verdict, decider, blocker,
+                          matches, findings)
+    if args.quiet:
+        print(report["verdict"])
+    elif args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        sys.stdout.write(render_text(report))
+    return 0 if verdict == "FOUND" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
